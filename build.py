@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,179 @@ ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
 ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
+DIAGNOSTIC_REDACTED_PATH = "<PATH>"
+DIAGNOSTIC_REDACTED_USER = "<USER>"
+DIAGNOSTIC_REDACTED_HOST = "<HOSTNAME>"
+
+
+class DiagnosticArtifactError(Exception):
+    """Raised when diagnostic JSON and .logd artifacts are missing or mismatched."""
+
+
+def _diagnostic_path_prefixes(root: Path) -> list[str]:
+    prefixes: list[str] = []
+    home = Path.home()
+    if home:
+        prefixes.append(str(home))
+    prefixes.append(str(root))
+    prefixes.append(tempfile.gettempdir())
+    for key in ("TEMP", "TMP"):
+        value = os.environ.get(key)
+        if value:
+            prefixes.append(value)
+    return sorted({prefix for prefix in prefixes if prefix and len(prefix) > 1}, key=len, reverse=True)
+
+
+def redact_diagnostic_text(text: str, root: Path = ROOT) -> str:
+    """Remove host-specific paths and identifiers from diagnostic text."""
+    if not text:
+        return text
+
+    redacted = text
+    for prefix in _diagnostic_path_prefixes(root):
+        redacted = redacted.replace(prefix, DIAGNOSTIC_REDACTED_PATH)
+        if os.sep != "/":
+            redacted = redacted.replace(prefix.replace(os.sep, "/"), DIAGNOSTIC_REDACTED_PATH)
+        if os.sep != "\\":
+            redacted = redacted.replace(prefix.replace(os.sep, "\\"), DIAGNOSTIC_REDACTED_PATH)
+
+    username = getpass.getuser()
+    if username and len(username) > 1:
+        redacted = redacted.replace(username, DIAGNOSTIC_REDACTED_USER)
+
+    hostname = platform.node()
+    if hostname and len(hostname) > 1:
+        redacted = redacted.replace(hostname, DIAGNOSTIC_REDACTED_HOST)
+
+    return redacted
+
+
+def diagnostic_repo_relpath(path: Path | str, root: Path = ROOT) -> str:
+    """Return a repository-relative path using forward slashes."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.relative_to(root)
+        except ValueError:
+            return redact_diagnostic_text(str(path), root).replace("\\", "/")
+    return candidate.as_posix()
+
+
+def sanitize_diagnostic_artifact_path(path: Optional[str], root: Path = ROOT) -> Optional[str]:
+    if path is None:
+        return None
+    return diagnostic_repo_relpath(path, root)
+
+
+def normalize_logd_relpaths(logd_relpaths: Optional[list[str]], root: Path = ROOT) -> Optional[list[str]]:
+    if not logd_relpaths:
+        return None
+    return [diagnostic_repo_relpath(path, root) for path in logd_relpaths]
+
+
+def encryptly_failure_message(stderr: str, stdout: str, default: str) -> str:
+    """Return a safe encryptly error message without leaking stdout passwords."""
+    message = stderr.strip()
+    if message:
+        return message
+
+    candidate = stdout.strip()
+    if not candidate:
+        return default
+
+    # encryptly prints the decrypt password on stdout even when pack fails
+    if len(candidate) <= 64 and all(char in "0123456789abcdef" for char in candidate.lower()):
+        return default
+
+    return candidate
+
+
+def validate_diagnostic_artifact_pair(
+    root: Path,
+    metadata_path: Path,
+    *,
+    require_logd: bool = True,
+) -> dict:
+    """Validate diagnostic JSON metadata and its referenced .logd artifact(s)."""
+    if not metadata_path.exists():
+        raise DiagnosticArtifactError(
+            f"Diagnostic metadata missing: {diagnostic_repo_relpath(metadata_path, root)}"
+        )
+
+    try:
+        report = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise DiagnosticArtifactError(
+            f"Diagnostic metadata is not valid JSON: {diagnostic_repo_relpath(metadata_path, root)}"
+        ) from exc
+
+    commit_id = report.get("commit")
+    if not commit_id:
+        raise DiagnosticArtifactError("Diagnostic metadata is missing commit id")
+
+    expected_stem = f"build-{commit_id}"
+    if metadata_path.stem != expected_stem:
+        raise DiagnosticArtifactError(
+            f"Metadata filename {metadata_path.name} does not match commit id {commit_id}"
+        )
+
+    logd_ref = report.get("diagnostic_logd")
+    if logd_ref is None:
+        if require_logd and not report.get("diagnostic_logd_error"):
+            raise DiagnosticArtifactError(
+                "diagnostic_logd is null but no diagnostic_logd_error was recorded"
+            )
+        return report
+
+    refs = logd_ref if isinstance(logd_ref, list) else [logd_ref]
+    for ref in refs:
+        if not isinstance(ref, str):
+            raise DiagnosticArtifactError(
+                f"diagnostic_logd entry must be a string, got {type(ref).__name__}"
+            )
+        if "\\" in ref:
+            raise DiagnosticArtifactError(
+                f"diagnostic_logd must use repository-relative forward-slash paths, got: {ref}"
+            )
+        if Path(ref).is_absolute() or (len(ref) > 1 and ref[1] == ":"):
+            raise DiagnosticArtifactError(
+                f"diagnostic_logd must be repository-relative, got: {ref}"
+            )
+        if not ref.startswith("diagnostic/"):
+            raise DiagnosticArtifactError(
+                f"diagnostic_logd must live under diagnostic/, got: {ref}"
+            )
+
+        logd_path = root / ref
+        if logd_path.stem != expected_stem and not logd_path.stem.startswith(f"{expected_stem}-part"):
+            raise DiagnosticArtifactError(
+                f"diagnostic_logd {ref} does not pair with metadata commit {commit_id}"
+            )
+        if not logd_path.exists():
+            raise DiagnosticArtifactError(f"Referenced diagnostic .logd artifact missing: {ref}")
+        if logd_path.stat().st_size == 0:
+            raise DiagnosticArtifactError(f"Referenced diagnostic .logd artifact is empty: {ref}")
+
+    return report
+
+
+def validate_diagnostic_metadata(metadata_path: Path, root: Path = ROOT) -> list[str]:
+    """Validate diagnostic metadata and return human-readable errors."""
+    try:
+        validate_diagnostic_artifact_pair(root, metadata_path)
+    except DiagnosticArtifactError as exc:
+        return [str(exc)]
+
+    report = json.loads(metadata_path.read_text(encoding="utf-8"))
+    errors: list[str] = []
+    report_text = json.dumps(report)
+    for token in _diagnostic_path_prefixes(root):
+        if token and token in report_text:
+            errors.append(f"diagnostic metadata leaks local path `{token}`")
+    for token in (getpass.getuser(), platform.node()):
+        if token and len(token) > 1 and token in report_text:
+            errors.append(f"diagnostic metadata leaks local identifier `{token}`")
+    return errors
 
 
 def current_commit_id() -> str:
@@ -251,7 +425,11 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
             timeout=timeout,
         )
         if result.returncode != 0:
-            output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
+            output = encryptly_failure_message(
+                result.stderr,
+                result.stdout,
+                "encryptly pack preflight failed",
+            )
             return False, output
         if not logd_path.exists():
             return False, "encryptly preflight completed without creating a .logd"
@@ -445,8 +623,8 @@ def collect_system_info() -> str:
         "Tent of Trials - System Diagnostic Snapshot",
         "=" * 50,
         f"generated_at: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
-        f"hostname: {platform.node()}",
-        f"user: {getpass.getuser()}",
+        f"hostname: {DIAGNOSTIC_REDACTED_HOST}",
+        f"user: {DIAGNOSTIC_REDACTED_USER}",
         f"python: {sys.version}",
         f"platform: {platform.platform()}",
         f"processor: {platform.processor() or 'unknown'}",
@@ -455,27 +633,31 @@ def collect_system_info() -> str:
         "--- uname ---",
     ]
     ok, out = run_cmd(["uname", "-a"])
-    lines.append(out if ok else "unavailable")
+    lines.append(redact_diagnostic_text(out if ok else "unavailable"))
 
     lines.extend(["", "--- /etc/os-release ---"])
     try:
-        lines.append((Path("/etc/os-release")).read_text(encoding="utf-8", errors="replace").strip())
+        lines.append(
+            redact_diagnostic_text(
+                (Path("/etc/os-release")).read_text(encoding="utf-8", errors="replace").strip()
+            )
+        )
     except Exception as e:
         lines.append(f"unavailable: {e}")
 
     lines.extend(["", "--- memory ---"])
     ok, out = run_cmd(["free", "-h"])
-    lines.append(out if ok else "unavailable")
+    lines.append(redact_diagnostic_text(out if ok else "unavailable"))
 
     lines.extend(["", "--- disk ---"])
     ok, out = run_cmd(["df", "-h"])
-    lines.append(out if ok else "unavailable")
+    lines.append(redact_diagnostic_text(out if ok else "unavailable"))
 
     lines.extend(["", "--- build environment ---"])
     for key in ["SHELL", "LANG", "TERM", "XDG_SESSION_TYPE", "DISPLAY", "EDITOR"]:
         value = os.environ.get(key)
         if value:
-            lines.append(f"{key}={value}")
+            lines.append(f"{key}={redact_diagnostic_text(value)}")
 
     lines.append("")
     return "\n".join(lines)
@@ -490,6 +672,8 @@ def build_diagnostic_report(
     chunked: bool = False,
     message_blocker: Optional[str] = None,
 ) -> dict:
+    logd_relpaths = normalize_logd_relpaths(logd_relpaths)
+
     diagnostic_logd: Optional[str | list[str]]
     if not logd_relpaths:
         diagnostic_logd = None
@@ -500,13 +684,13 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = diagnostic_repo_relpath(DIAGNOSTIC_DIR / f"build-{commit_id}.logd")
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "commit": commit_id,
         "diagnostic_logd": diagnostic_logd,
-        "diagnostic_logd_error": logd_error,
+        "diagnostic_logd_error": redact_diagnostic_text(logd_error) if logd_error else None,
         "message_blocker": message_blocker,
         "chunked": chunked,
         "chunk_size_bytes": DIAGNOSTIC_CHUNK_SIZE if chunked else None,
@@ -523,8 +707,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": sanitize_diagnostic_artifact_path(binary),
+                "output": redact_diagnostic_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -539,7 +723,11 @@ def build_diagnostic_report(
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
     metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
+    try:
+        display_path = metadata_path.relative_to(ROOT)
+    except ValueError:
+        display_path = metadata_path
+    print(f"    {color('✓', Colors.GREEN)} {display_path} created")
 
 
 def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
@@ -645,9 +833,11 @@ def generate_logd(
             "module results:",
         ]
         for name, success, elapsed, _, binary in results:
+            artifact_note = ""
+            if binary:
+                artifact_note = f" [{sanitize_diagnostic_artifact_path(binary)}]"
             summary_lines.append(
-                f"  {name}: {'PASS' if success else 'FAIL'} ({elapsed:.2f}s)"
-                f"{f' [{binary}]' if binary else ''}"
+                f"  {name}: {'PASS' if success else 'FAIL'} ({elapsed:.2f}s){artifact_note}"
             )
         (safe_dir / "build-summary.txt").write_text(
             "\n".join(summary_lines), encoding="utf-8"
@@ -660,9 +850,9 @@ def generate_logd(
                 f"{'=' * 50}"
             )
             if binary:
-                log_lines.append(f"artifact: {binary}")
+                log_lines.append(f"artifact: {sanitize_diagnostic_artifact_path(binary)}")
             if output:
-                log_lines.append(output)
+                log_lines.append(redact_diagnostic_text(output))
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
         sr = subprocess.run(
@@ -681,7 +871,11 @@ def generate_logd(
             timeout=300,
         )
         if sr.returncode != 0:
-            error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
+            error = encryptly_failure_message(
+                sr.stderr,
+                sr.stdout,
+                "encryptly pack failed",
+            )
             print(
                 f"    {color('✗', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
                 f"{error}"
@@ -703,8 +897,12 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [diagnostic_repo_relpath(path) for path in logd_files]
+        decrypt_target = (
+            logd_relpaths[0]
+            if len(logd_relpaths) == 1
+            else diagnostic_repo_relpath(logd_path)
+        )
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
