@@ -33,7 +33,7 @@ use std::io::{Cursor, Read, Write};
 pub const FRAME_MAGIC: u32 = 0x544F5446;
 
 /// Size of the frame header in bytes.
-pub const FRAME_HEADER_SIZE: usize = 24;
+pub const FRAME_HEADER_SIZE: usize = 20;
 
 /// Maximum frame payload size (16 MB).
 pub const FRAME_MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -142,7 +142,9 @@ impl FrameEncoder {
         Ok(buf)
     }
 
-    pub fn encode_stream<'a>(frames: impl Iterator<Item = &'a Frame>) -> Result<Vec<u8>, ProtocolError> {
+    pub fn encode_stream<'a>(
+        frames: impl Iterator<Item = &'a Frame>,
+    ) -> Result<Vec<u8>, ProtocolError> {
         let mut buf = Vec::new();
         for frame in frames {
             buf.extend_from_slice(&Self::encode(frame)?);
@@ -181,49 +183,67 @@ impl FrameDecoder {
 
         // Read and validate magic
         let mut magic_bytes = [0u8; 4];
-        cursor.read_exact(&mut magic_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut magic_bytes)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
         let magic = u32::from_be_bytes(magic_bytes);
         if magic != FRAME_MAGIC {
-            self.buffer.clear();
+            self.discard_through_next_magic();
             return Err(ProtocolError::InvalidMessage);
         }
 
         // Read version
         let mut version_bytes = [0u8; 1];
-        cursor.read_exact(&mut version_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut version_bytes)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
         let version = version_bytes[0];
         if version < MIN_COMPATIBLE_VERSION as u8 || version > PROTOCOL_VERSION as u8 {
-            self.buffer.clear();
+            self.discard_through_next_magic();
             return Err(ProtocolError::UnsupportedVersion);
         }
 
         // Read message type
         let mut type_bytes = [0u8; 1];
-        cursor.read_exact(&mut type_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut type_bytes)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
         let message_type = type_bytes[0];
 
         // Read flags
         let mut flags_bytes = [0u8; 2];
-        cursor.read_exact(&mut flags_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut flags_bytes)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
         let flags = u16::from_be_bytes(flags_bytes);
 
         // Read payload length
         let mut len_bytes = [0u8; 4];
-        cursor.read_exact(&mut len_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut len_bytes)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
         let payload_length = u32::from_be_bytes(len_bytes) as usize;
         if payload_length > FRAME_MAX_PAYLOAD_SIZE {
-            self.buffer.clear();
+            self.discard_through_next_magic();
             return Err(ProtocolError::MessageTooLarge);
         }
 
         // Read sequence number
         let mut seq_bytes = [0u8; 4];
-        cursor.read_exact(&mut seq_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut seq_bytes)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
         let sequence = u32::from_be_bytes(seq_bytes);
 
         // Skip reserved bytes
         let mut reserved = [0u8; 4];
-        cursor.read_exact(&mut reserved).map_err(|_| ProtocolError::InvalidMessage)?;
+        cursor
+            .read_exact(&mut reserved)
+            .map_err(|_| ProtocolError::InvalidMessage)?;
+        if reserved != [0u8; 4] {
+            self.discard_through_next_magic();
+            return Err(ProtocolError::InvalidMessage);
+        }
 
         // Check if we have the full frame
         let checksum_size = if flags & FLAG_CHECKSUMED != 0 { 4 } else { 0 };
@@ -287,6 +307,18 @@ impl FrameDecoder {
         self.buffer.clear();
         self.partial_frame = None;
     }
+
+    fn discard_through_next_magic(&mut self) {
+        let magic = FRAME_MAGIC.to_be_bytes();
+        if let Some(next_magic) = self.buffer[1..]
+            .windows(magic.len())
+            .position(|window| window == magic)
+        {
+            self.buffer.drain(..next_magic + 1);
+        } else {
+            self.buffer.clear();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,11 +361,31 @@ static CRC32C_TABLE: [u32; 256] = {
 mod tests {
     use super::*;
 
+    fn assert_decode_error_then_recover(mut bad_frame: Vec<u8>, expected: ProtocolError) {
+        let valid_frame = Frame::new(0x33, b"valid after error".to_vec())
+            .with_sequence(77)
+            .with_checksum();
+        let valid_encoded = FrameEncoder::encode(&valid_frame).unwrap();
+
+        bad_frame.extend_from_slice(&valid_encoded);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&bad_frame);
+
+        assert!(matches!(decoder.decode(), Err(error) if error == expected));
+
+        let recovered = decoder.decode().unwrap().unwrap();
+        assert_eq!(recovered.message_type, 0x33);
+        assert_eq!(recovered.sequence, 77);
+        assert_eq!(recovered.payload, b"valid after error");
+        assert!(decoder.decode().unwrap().is_none());
+        assert_eq!(decoder.buffered_bytes(), 0);
+    }
+
     #[test]
     fn test_frame_encode_decode() {
         let payload = b"Hello, World!".to_vec();
-        let frame = Frame::new(0x01, payload.clone())
-            .with_checksum();
+        let frame = Frame::new(0x01, payload.clone()).with_checksum();
 
         let encoded = FrameEncoder::encode(&frame).unwrap();
 
@@ -389,5 +441,74 @@ mod tests {
         decoder.feed(&encoded);
         let result = decoder.decode();
         assert!(matches!(result, Err(ProtocolError::ChecksumMismatch)));
+    }
+
+    #[test]
+    fn test_truncated_header_waits_for_more_input() {
+        let frame = Frame::new(0x01, b"header recovery".to_vec());
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded[..FRAME_HEADER_SIZE - 1]);
+
+        assert!(decoder.decode().unwrap().is_none());
+        assert_eq!(decoder.buffered_bytes(), FRAME_HEADER_SIZE - 1);
+
+        decoder.feed(&encoded[FRAME_HEADER_SIZE - 1..]);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"header recovery");
+        assert_eq!(decoder.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_truncated_payload_waits_and_preserves_state() {
+        let frame = Frame::new(0x02, b"payload recovery".to_vec()).with_checksum();
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+        let split_at = FRAME_HEADER_SIZE + 4;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded[..split_at]);
+
+        assert!(decoder.decode().unwrap().is_none());
+        assert_eq!(decoder.buffered_bytes(), split_at);
+
+        decoder.feed(&encoded[split_at..]);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"payload recovery");
+        assert!(decoded.checksum.is_some());
+        assert_eq!(decoder.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_invalid_reserved_bytes_reject_and_recover() {
+        let mut bad = FrameEncoder::encode(&Frame::new(0x03, b"bad reserved".to_vec())).unwrap();
+        bad[16] = 0x80;
+
+        assert_decode_error_then_recover(bad, ProtocolError::InvalidMessage);
+    }
+
+    #[test]
+    fn test_invalid_payload_length_reject_and_recover() {
+        let mut bad = FrameEncoder::encode(&Frame::new(0x04, b"too long".to_vec())).unwrap();
+        bad[8..12].copy_from_slice(&((FRAME_MAX_PAYLOAD_SIZE as u32) + 1).to_be_bytes());
+
+        assert_decode_error_then_recover(bad, ProtocolError::MessageTooLarge);
+    }
+
+    #[test]
+    fn test_checksum_mismatch_rejects_current_frame_and_recovers() {
+        let mut bad =
+            FrameEncoder::encode(&Frame::new(0x05, b"checksum mismatch".to_vec()).with_checksum())
+                .unwrap();
+        bad[FRAME_HEADER_SIZE] ^= 0xFF;
+
+        assert_decode_error_then_recover(bad, ProtocolError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn test_invalid_magic_rejects_prefix_and_recovers() {
+        let bad = b"not a frame".to_vec();
+
+        assert_decode_error_then_recover(bad, ProtocolError::InvalidMessage);
     }
 }
