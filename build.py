@@ -10,14 +10,122 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
 ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
+
+
+class DiagnosticValidationError(RuntimeError):
+    pass
+
+
+def repo_relative_path(path: Path | str) -> str:
+    """Return a deterministic repo-relative path using forward slashes."""
+    path_obj = Path(path)
+    if not path_obj.is_absolute():
+        return str(path).replace("\\", "/")
+    try:
+        return path_obj.resolve().relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return f"external/{path_obj.name}"
+
+
+def _redaction_tokens() -> list[tuple[str, str]]:
+    tokens = [
+        (str(ROOT), "<repo>"),
+        (str(Path.home()), "<home>"),
+        (tempfile.gettempdir(), "<temp>"),
+        (platform.node(), "<machine>"),
+        (getpass.getuser(), "<user>"),
+    ]
+    for key in ("USERNAME", "USER", "LOGNAME", "COMPUTERNAME"):
+        value = os.environ.get(key)
+        if value:
+            tokens.append((value, f"<{key.lower()}>"))
+
+    expanded: list[tuple[str, str]] = []
+    for token, replacement in tokens:
+        if not token:
+            continue
+        expanded.append((token, replacement))
+        expanded.append((token.replace("\\", "/"), replacement))
+        expanded.append((token.replace("/", "\\"), replacement))
+
+    expanded.sort(key=lambda item: len(item[0]), reverse=True)
+    return expanded
+
+
+def redact_diagnostic_text(value: str) -> str:
+    redacted = value
+    for token, replacement in _redaction_tokens():
+        redacted = redacted.replace(token, replacement)
+    return redacted
+
+
+def sanitize_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: sanitize_diagnostic_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_diagnostic_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_diagnostic_value(item) for item in value]
+    if isinstance(value, Path):
+        return repo_relative_path(value)
+    if isinstance(value, str):
+        return redact_diagnostic_text(value)
+    return value
+
+
+def validate_diagnostic_pair(
+    metadata_path: Path,
+    expected_logd_paths: Optional[list[Path]] = None,
+) -> None:
+    if not metadata_path.exists():
+        raise DiagnosticValidationError(
+            f"diagnostic metadata JSON missing: {repo_relative_path(metadata_path)}"
+        )
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise DiagnosticValidationError(
+            f"diagnostic metadata JSON invalid: {repo_relative_path(metadata_path)}: {exc}"
+        ) from exc
+
+    logd_value = metadata.get("diagnostic_logd")
+    if not logd_value:
+        if metadata.get("diagnostic_logd_error"):
+            return
+        raise DiagnosticValidationError(
+            f"diagnostic_logd missing in {repo_relative_path(metadata_path)}"
+        )
+
+    logd_refs = logd_value if isinstance(logd_value, list) else [logd_value]
+    normalized_refs: list[str] = []
+    for ref in logd_refs:
+        if not isinstance(ref, str) or not ref.strip():
+            raise DiagnosticValidationError("diagnostic_logd must contain non-empty path strings")
+        normalized_ref = ref.replace("\\", "/")
+        ref_path = Path(normalized_ref)
+        if ref_path.is_absolute() or PureWindowsPath(ref).is_absolute() or PurePosixPath(ref).is_absolute():
+            raise DiagnosticValidationError(f"diagnostic_logd must be repo-relative: {ref}")
+        artifact_path = ROOT.joinpath(*normalized_ref.split("/"))
+        if not artifact_path.exists():
+            raise DiagnosticValidationError(f"diagnostic .logd missing: {normalized_ref}")
+        normalized_refs.append(normalized_ref)
+
+    if expected_logd_paths is not None:
+        expected = [repo_relative_path(path) for path in expected_logd_paths]
+        if normalized_refs != expected:
+            raise DiagnosticValidationError(
+                f"diagnostic_logd mismatch: metadata has {normalized_refs}, expected {expected}"
+            )
 
 
 def current_commit_id() -> str:
@@ -222,7 +330,7 @@ def encryptly_platform_help() -> str:
     return f"detected {detected}; available: {available}"
 
 
-def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
+def check_encryptly_runs(timeout: int = 180) -> tuple[bool, str]:
     """Verify encryptly can create a diagnostic bundle before doing any build work."""
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
@@ -230,9 +338,14 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
 
     workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
     safe_dir = workspace / "safe"
-    logd_path = workspace / "preflight.logd"
+    # Keep the output outside the included tree. Some encryptly builds stream the
+    # destination while walking --include, which can otherwise pack the growing
+    # .logd into itself and make the preflight hang or balloon.
+    logd_path = workspace.parent / "preflight.logd"
     try:
         shutil.rmtree(workspace, ignore_errors=True)
+        if logd_path.exists():
+            logd_path.unlink()
         safe_dir.mkdir(parents=True, exist_ok=True)
         (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
         result = subprocess.run(
@@ -262,6 +375,8 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
         return False, str(e)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+        if logd_path.exists():
+            logd_path.unlink()
 
 class Colors:
     GREEN = "\033[92m"
@@ -276,6 +391,43 @@ def color(text: str, code: str) -> str:
     if not sys.stdout.isatty():
         return text
     return f"{code}{text}{Colors.RESET}"
+
+
+def output_supports(text: str) -> bool:
+    encoding = (getattr(sys.stdout, "encoding", None) or "utf-8").lower().replace("_", "-")
+    if encoding not in {"utf-8", "utf8", "cp65001"}:
+        return False
+    try:
+        text.encode(encoding)
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def safe_text(text: str, fallback: str) -> str:
+    return text if output_supports(text) else fallback
+
+
+def mark(symbol: str, fallback: str) -> str:
+    return safe_text(symbol, fallback)
+
+
+def rule(width: int) -> str:
+    return safe_text("─" * width, "-" * width)
+
+
+def configure_output_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+configure_output_streams()
 
 def check_prerequisites() -> list[str]:
     required = {
@@ -306,7 +458,7 @@ def build_module(
     verbose: bool = False,
 ) -> tuple[bool, float, str]:
 
-    print(f"\n  {color('▸', Colors.CYAN)} Building {color(module.name, Colors.BOLD)} ({module.language})...")
+    print(f"\n  {color(mark('▸', '>'), Colors.CYAN)} Building {color(module.name, Colors.BOLD)} ({module.language})...")
 
     env = os.environ.copy()
     if module.env:
@@ -329,6 +481,8 @@ def build_module(
                 )
                 if install_result.returncode != 0:
                     return False, time.time() - start, f"npm install failed:\n{install_result.stderr}"
+            except FileNotFoundError as e:
+                return False, time.time() - start, f"npm install command not found: {e}"
             except subprocess.TimeoutExpired:
                 return False, time.time() - start, "npm install TIMEOUT (120s)"
 
@@ -348,7 +502,7 @@ def build_module(
         except subprocess.TimeoutExpired:
             return False, time.time() - start, "CMake configure TIMEOUT (120s)"
         except FileNotFoundError as e:
-            return False, 0, f"Command not found: {e}"
+            return False, time.time() - start, f"CMake configure command not found: {e}"
         if cfg_result.returncode != 0:
             output_lines = []
             if cfg_result.stdout:
@@ -397,7 +551,7 @@ def build_module(
     return success, elapsed, output
 
 def clean_module(module: Module, verbose: bool = False) -> bool:
-    print(f"  {color('▸', Colors.YELLOW)} Cleaning {module.name}...")
+    print(f"  {color(mark('▸', '>'), Colors.YELLOW)} Cleaning {module.name}...")
     try:
         subprocess.run(
             module.clean_cmd,
@@ -409,7 +563,7 @@ def clean_module(module: Module, verbose: bool = False) -> bool:
         )
         return True
     except Exception as e:
-        print(f"    {color('✗', Colors.RED)} Clean failed: {e}")
+        print(f"    {color(mark('✗', 'x'), Colors.RED)} Clean failed: {e}")
         return False
 
 def verify_binary(module: Module) -> Optional[str]:
@@ -490,6 +644,9 @@ def build_diagnostic_report(
     chunked: bool = False,
     message_blocker: Optional[str] = None,
 ) -> dict:
+    if logd_relpaths:
+        logd_relpaths = [repo_relative_path(path) for path in logd_relpaths]
+
     diagnostic_logd: Optional[str | list[str]]
     if not logd_relpaths:
         diagnostic_logd = None
@@ -500,7 +657,7 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = repo_relative_path(DIAGNOSTIC_DIR / f"build-{commit_id}.logd")
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -523,8 +680,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": repo_relative_path(binary) if binary else None,
+                "output": redact_diagnostic_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -534,12 +691,12 @@ def build_diagnostic_report(
             + "Maintainers may ask you to remove these diagnostic artifacts before merging."
         ),
     }
-    return report
+    return sanitize_diagnostic_value(report)
 
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
     metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
+    print(f"    {color(mark('✓', '+'), Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
 
 
 def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
@@ -597,7 +754,7 @@ def generate_logd(
 ) -> bool:
     logd_path, metadata_path, commit_id = diagnostic_paths_for_commit()
     display_logd = logd_path.relative_to(ROOT)
-    print(f"\n  {color('▸', Colors.CYAN)} Finalizing diagnostics for {color(str(display_logd), Colors.BOLD)}...")
+    print(f"\n  {color(mark('▸', '>'), Colors.CYAN)} Finalizing diagnostics for {color(str(display_logd), Colors.BOLD)}...")
 
     # Always write the JSON report first. The encrypted .logd is useful, but the
     # report is required even when the build failed before compilation started or
@@ -607,7 +764,7 @@ def generate_logd(
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
         error = f"encryptly binary not found ({encryptly_platform_help()}); cannot create {display_logd}"
-        print(f"    {color('✗', Colors.RED)} {error}")
+        print(f"    {color(mark('✗', 'x'), Colors.RED)} {error}")
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
@@ -631,7 +788,7 @@ def generate_logd(
         safe_dir.mkdir(parents=True, exist_ok=True)
 
         (safe_dir / "system-info.txt").write_text(
-            collect_system_info(), encoding="utf-8"
+            redact_diagnostic_text(collect_system_info()), encoding="utf-8"
         )
 
         summary_lines = [
@@ -647,7 +804,7 @@ def generate_logd(
         for name, success, elapsed, _, binary in results:
             summary_lines.append(
                 f"  {name}: {'PASS' if success else 'FAIL'} ({elapsed:.2f}s)"
-                f"{f' [{binary}]' if binary else ''}"
+                f"{f' [{repo_relative_path(binary)}]' if binary else ''}"
             )
         (safe_dir / "build-summary.txt").write_text(
             "\n".join(summary_lines), encoding="utf-8"
@@ -660,9 +817,9 @@ def generate_logd(
                 f"{'=' * 50}"
             )
             if binary:
-                log_lines.append(f"artifact: {binary}")
+                log_lines.append(f"artifact: {repo_relative_path(binary)}")
             if output:
-                log_lines.append(output)
+                log_lines.append(redact_diagnostic_text(output))
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
         sr = subprocess.run(
@@ -683,7 +840,7 @@ def generate_logd(
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
             print(
-                f"    {color('✗', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
+                f"    {color(mark('✗', 'x'), Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
                 f"{error}"
             )
             if logd_path.exists():
@@ -703,8 +860,8 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [repo_relative_path(path) for path in logd_files]
+        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else repo_relative_path(logd_path)
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
@@ -719,12 +876,13 @@ def generate_logd(
         for path in logd_files:
             size_kb = path.stat().st_size / 1024.0
             print(
-                f"    {color('✓', Colors.GREEN)} {path.relative_to(ROOT)} created "
+                f"    {color(mark('✓', '+'), Colors.GREEN)} {path.relative_to(ROOT)} created "
                 f"({size_kb:.1f} KiB)"
             )
+        validate_diagnostic_pair(metadata_path, expected_logd_paths=logd_files)
         if len(logd_files) > 1:
             print(
-                f"    {color('✓', Colors.GREEN)} split oversized diagnostic log into "
+                f"    {color(mark('✓', '+'), Colors.GREEN)} split oversized diagnostic log into "
                 f"{len(logd_files)} chunks of at most {DIAGNOSTIC_CHUNK_SIZE // (1024 * 1024)} MiB"
             )
         if not commit_diagnostic_artifacts([metadata_path, *logd_files], commit_id):
@@ -737,7 +895,7 @@ def generate_logd(
             print(f"             diagnostic log file(s) and metadata file with this password.")
             if len(logd_files) > 1:
                 print(f"             Reassemble chunks in order before unpacking:")
-                print(f"             cat {' '.join(logd_relpaths)} > {logd_path.relative_to(ROOT)}")
+                print(f"             cat {' '.join(logd_relpaths)} > {repo_relative_path(logd_path)}")
             print(f"  {color(safe_pw, Colors.CYAN)}")
             print(f"  {color(f'encryptly unpack {decrypt_target} <outdir> --password {safe_pw}', Colors.GRAY)}")
         return True
@@ -755,13 +913,13 @@ def print_summary(results: list[tuple[str, bool, float, str, Optional[str]]]):
     total_time = sum(t for _, _, t, _, _ in results)
 
     for name, success, elapsed, output, binary in results:
-        status_icon = color("✓", Colors.GREEN) if success else color("✗", Colors.RED)
+        status_icon = color(mark("✓", "+"), Colors.GREEN) if success else color(mark("✗", "x"), Colors.RED)
         status_text = color("PASS", Colors.GREEN) if success else color("FAIL", Colors.RED)
         time_str = f"{elapsed:.1f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
 
         print(f"\n  {status_icon}  {color(name + ':', Colors.BOLD)} {status_text}  ({time_str})")
         if binary:
-            print(f"       artifact: {color(binary, Colors.GRAY)}")
+            print(f"       artifact: {color(repo_relative_path(binary), Colors.GRAY)}")
         if not success and output:
 
             lines = output.strip().split("\n")
@@ -769,7 +927,7 @@ def print_summary(results: list[tuple[str, bool, float, str, Optional[str]]]):
             for line in lines[-5:]:
                 print(f"       {color(line, Colors.GRAY)}")
 
-    print(f"\n  {color('─' * 40, Colors.GRAY)}")
+    print(f"\n  {color(rule(40), Colors.GRAY)}")
     print(f"  {color('Total:', Colors.BOLD)} {total} modules, "
           f"{color(str(passed) + ' passed', Colors.GREEN)}, "
           f"{color(str(failed) + ' failed', Colors.RED)}, "
@@ -831,14 +989,14 @@ Diagnostic bundle:
     print(f"  {color('Checking prerequisites...', Colors.GRAY)}")
     missing = check_prerequisites()
     if missing:
-        print(f"\n  {color('⚠ Some tools missing  -  will try anyway:', Colors.YELLOW)}")
+        print(f"\n  {color(safe_text('⚠ Some tools missing  -  will try anyway:', 'WARNING Some tools missing  -  will try anyway:'), Colors.YELLOW)}")
         for m in missing:
             print(f"    {m}")
 
         msg = "Not all modules will build. That's fine."
         print(f"  {color(msg, Colors.GRAY)}")
     else:
-        print(f"  {color('✓ All prerequisites found', Colors.GREEN)}")
+        print(f"  {color(safe_text('✓ All prerequisites found', '+ All prerequisites found'), Colors.GREEN)}")
     if args.module == "all":
         selected = MODULES
     else:
@@ -846,7 +1004,7 @@ Diagnostic bundle:
         selected = [m for m in MODULES if m.name in names]
         not_found = set(names) - {m.name for m in MODULES}
         if not_found:
-            print(f"  {color('✗ Unknown modules:', Colors.RED)} {', '.join(not_found)}")
+            print(f"  {color(safe_text('✗ Unknown modules:', 'x Unknown modules:'), Colors.RED)} {', '.join(not_found)}")
             print(f"    Available: {', '.join(m.name for m in MODULES)}")
             return 1
 
@@ -871,7 +1029,7 @@ Diagnostic bundle:
                     shutil.rmtree(artifact)
                 else:
                     artifact.unlink()
-                print(f"  {color('▸', Colors.YELLOW)} Removed {artifact.relative_to(ROOT)}")
+                print(f"  {color(mark('▸', '>'), Colors.YELLOW)} Removed {artifact.relative_to(ROOT)}")
         print(f"\n  {color('Clean complete.', Colors.GREEN)}")
         return 0
 
