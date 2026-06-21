@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-06-21T13:25:40.784594+00:00",
+  "commit": "d8514bf7",
+  "diagnostic_logd": "diagnostic/build-d8514bf7.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "19800841b2952655813e",
+  "decrypt_command": "encryptly unpack diagnostic/build-d8514bf7.logd <outdir> --password 19800841b2952655813e",
+  "total_modules": 1,
+  "passed": 1,
+  "failed": 0,
+  "modules": [
+    {
+      "name": "frailbox",
+      "status": "PASS",
+      "elapsed_seconds": 0.011,
+      "artifact": "frailbox/frailbox",
+      "output": "make: Nothing to be done for 'all'."
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-d8514bf7.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}

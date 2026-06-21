@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -440,6 +441,129 @@ def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _redaction_tokens() -> list[str]:
+    """Return local-only values that must not be written to diagnostic metadata."""
+    values: set[str] = set()
+
+    path_values = [
+        ROOT,
+        Path.home(),
+        Path(tempfile.gettempdir()),
+    ]
+    for env_key in ("TMP", "TEMP", "TMPDIR"):
+        env_value = os.environ.get(env_key)
+        if env_value:
+            path_values.append(Path(env_value))
+
+    for path in path_values:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        for candidate in {str(path), path.as_posix(), str(resolved), resolved.as_posix()}:
+            if candidate:
+                values.add(candidate)
+
+    for env_key in ("USER", "USERNAME", "LOGNAME"):
+        env_value = os.environ.get(env_key)
+        if env_value:
+            values.add(env_value)
+
+    for value in (getpass.getuser(), platform.node()):
+        if value:
+            values.add(value)
+
+    return sorted((value for value in values if value), key=len, reverse=True)
+
+
+def redact_diagnostic_text(value: str) -> str:
+    """Redact local paths, usernames, and hostnames from diagnostic metadata text."""
+    redacted = value
+    for token in _redaction_tokens():
+        redacted = redacted.replace(token, "<redacted>")
+    return redacted
+
+
+def repo_relative_metadata_path(path: Optional[str]) -> Optional[str]:
+    """Return a repository-relative `/` path when possible, otherwise redacted text."""
+    if path is None:
+        return None
+
+    path_obj = Path(path)
+    try:
+        relpath = path_obj.resolve().relative_to(ROOT)
+        return relpath.as_posix()
+    except (OSError, ValueError):
+        return redact_diagnostic_text(str(path))
+
+
+def _iter_metadata_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_metadata_strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_metadata_strings(nested)
+
+
+def validate_diagnostic_metadata(metadata_path: Path, root: Path = ROOT) -> list[str]:
+    """Validate diagnostic JSON redaction and `.logd` pairing.
+
+    Returns a list of human-readable validation errors. An empty list means the
+    metadata is safe to submit with its paired encrypted diagnostic artifact.
+    """
+    errors: list[str] = []
+    if not metadata_path.exists():
+        return [f"diagnostic metadata is missing: {metadata_path}"]
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"diagnostic metadata is not valid JSON: {exc}"]
+
+    logd_value = metadata.get("diagnostic_logd")
+    if isinstance(logd_value, str):
+        logd_paths = [logd_value]
+    elif isinstance(logd_value, list) and all(isinstance(item, str) for item in logd_value):
+        logd_paths = logd_value
+    else:
+        logd_paths = []
+        errors.append("diagnostic_logd must be a relative .logd path or a list of relative .logd paths")
+
+    for relpath in logd_paths:
+        if "\\" in relpath:
+            errors.append(f"diagnostic_logd uses backslashes instead of `/`: {relpath}")
+        if Path(relpath).is_absolute():
+            errors.append(f"diagnostic_logd must be repository-relative: {relpath}")
+        if ".." in Path(relpath).parts:
+            errors.append(f"diagnostic_logd must not traverse outside the repository: {relpath}")
+        if not relpath.endswith(".logd"):
+            errors.append(f"diagnostic_logd must point to a .logd artifact: {relpath}")
+        artifact_path = root / relpath
+        if not artifact_path.exists():
+            errors.append(f"diagnostic_logd artifact is missing: {relpath}")
+
+    sensitive_values = [value for value in _redaction_tokens() if value and value != str(root)]
+    for text_value in _iter_metadata_strings(metadata):
+        for token in sensitive_values:
+            if token in text_value:
+                errors.append(f"diagnostic metadata leaks local value `{token}`")
+
+    for module in metadata.get("modules", []):
+        if not isinstance(module, dict):
+            continue
+        artifact = module.get("artifact")
+        if isinstance(artifact, str):
+            if "\\" in artifact:
+                errors.append(f"module artifact uses backslashes instead of `/`: {artifact}")
+            if Path(artifact).is_absolute():
+                errors.append(f"module artifact must be repository-relative: {artifact}")
+
+    return errors
+
+
 def collect_system_info() -> str:
     lines = [
         "Tent of Trials - System Diagnostic Snapshot",
@@ -523,8 +647,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": repo_relative_metadata_path(binary),
+                "output": redact_diagnostic_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -631,7 +755,7 @@ def generate_logd(
         safe_dir.mkdir(parents=True, exist_ok=True)
 
         (safe_dir / "system-info.txt").write_text(
-            collect_system_info(), encoding="utf-8"
+            redact_diagnostic_text(collect_system_info()), encoding="utf-8"
         )
 
         summary_lines = [
@@ -662,7 +786,7 @@ def generate_logd(
             if binary:
                 log_lines.append(f"artifact: {binary}")
             if output:
-                log_lines.append(output)
+                log_lines.append(redact_diagnostic_text(output))
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
         sr = subprocess.run(
