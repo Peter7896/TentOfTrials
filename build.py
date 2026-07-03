@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
 import datetime
 import getpass
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
@@ -440,6 +444,86 @@ def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
         return False, str(e)
 
 
+def repo_relative_path(path: str | Path) -> str:
+    """Return a stable repository-relative path using forward slashes when possible."""
+    candidate = Path(path)
+    try:
+        return candidate.resolve().relative_to(ROOT).as_posix()
+    except (OSError, ValueError):
+        return candidate.as_posix()
+
+
+def _redaction_tokens() -> list[tuple[str, str]]:
+    """Sensitive local values that must not be persisted in PR diagnostic metadata."""
+    tokens: list[tuple[str, str]] = []
+    for value, replacement in [
+        (str(Path.home()), "<HOME>"),
+        (tempfile.gettempdir(), "<TEMP>"),
+        (str(ROOT), "<REPO>"),
+        (platform.node(), "<HOST>"),
+        (getpass.getuser(), "<USER>"),
+    ]:
+        if value:
+            tokens.append((value, replacement))
+            tokens.append((Path(value).as_posix(), replacement))
+    return sorted(set(tokens), key=lambda item: len(item[0]), reverse=True)
+
+
+def redact_diagnostic_value(value: Any) -> Any:
+    """Redact host/user/temp/home/repo absolute paths from diagnostic JSON values."""
+    if isinstance(value, dict):
+        return {key: redact_diagnostic_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_diagnostic_value(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    redacted = value
+    # Convert absolute in-repo paths to stable repository-relative paths before
+    # generic redaction so metadata remains useful without leaking checkout paths.
+    root_pattern = re.escape(str(ROOT)) + r"[/\\]+"
+    redacted = re.sub(root_pattern, "", redacted)
+    root_posix_pattern = re.escape(ROOT.as_posix()) + r"/+"
+    redacted = re.sub(root_posix_pattern, "", redacted)
+    redacted = redacted.replace("\\", "/")
+    for token, replacement in _redaction_tokens():
+        if token:
+            redacted = redacted.replace(token, replacement)
+    return redacted
+
+
+def validate_diagnostic_artifact_pair(
+    metadata_path: Path,
+    root: Path = ROOT,
+) -> tuple[bool, str]:
+    """Validate that diagnostic JSON references existing .logd artifact(s)."""
+    if not metadata_path.exists():
+        return False, f"metadata JSON missing: {metadata_path}"
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return False, f"metadata JSON invalid: {e}"
+
+    reference = metadata.get("diagnostic_logd")
+    if not reference:
+        return False, "metadata JSON missing diagnostic_logd reference"
+    references = reference if isinstance(reference, list) else [reference]
+    missing = []
+    for relpath in references:
+        if not isinstance(relpath, str) or Path(relpath).is_absolute():
+            return False, f"diagnostic_logd must be repository-relative: {relpath!r}"
+        candidate = root / relpath
+        if not candidate.exists():
+            missing.append(relpath)
+        elif candidate.suffix != ".logd":
+            return False, f"diagnostic artifact is not a .logd file: {relpath}"
+
+    if missing:
+        return False, f"missing {', '.join(missing)} referenced by {metadata_path}"
+    return True, f"matched {', '.join(references)} with {metadata_path}"
+
+
 def collect_system_info() -> str:
     lines = [
         "Tent of Trials - System Diagnostic Snapshot",
@@ -523,8 +607,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": repo_relative_path(binary) if binary else None,
+                "output": redact_diagnostic_value(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -603,6 +687,23 @@ def generate_logd(
     # report is required even when the build failed before compilation started or
     # when encryptly itself is unavailable.
     write_diagnostic_report(metadata_path, build_diagnostic_report(results, commit_id))
+    preflight_failure = next(
+        (output for name, success, _, output, _ in results if name == "encryptly-preflight" and not success),
+        None,
+    )
+    if preflight_failure:
+        write_diagnostic_report(
+            metadata_path,
+            build_diagnostic_report(
+                results,
+                commit_id,
+                logd_error=preflight_failure,
+                message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
+            ),
+        )
+        print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
+        commit_diagnostic_artifacts([metadata_path], commit_id)
+        return False
 
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
@@ -665,21 +766,42 @@ def generate_logd(
                 log_lines.append(output)
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
-        sr = subprocess.run(
-            [
-                str(encryptly_bin),
-                "pack",
-                str(logd_path),
-                "--include",
-                str(workspace),
-                "--max-file-size",
-                "35840",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        try:
+            sr = subprocess.run(
+                [
+                    str(encryptly_bin),
+                    "pack",
+                    str(logd_path),
+                    "--include",
+                    str(workspace),
+                    "--max-file-size",
+                    "35840",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            error = "encryptly pack TIMEOUT (300s)"
+            print(
+                f"    {color('✗', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
+                f"{error}"
+            )
+            if logd_path.exists():
+                logd_path.unlink()
+            write_diagnostic_report(
+                metadata_path,
+                build_diagnostic_report(
+                    results,
+                    commit_id,
+                    logd_error=error,
+                    message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
+                ),
+            )
+            print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
+            commit_diagnostic_artifacts([metadata_path], commit_id)
+            return False
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
             print(
@@ -715,6 +837,10 @@ def generate_logd(
                 chunked=len(logd_files) > 1,
             ),
         )
+        pair_ok, pair_message = validate_diagnostic_artifact_pair(metadata_path)
+        if not pair_ok:
+            print(f"    {color('✗', Colors.RED)} {pair_message}")
+            return False
 
         for path in logd_files:
             size_kb = path.stat().st_size / 1024.0
