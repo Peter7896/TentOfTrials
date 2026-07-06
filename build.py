@@ -19,6 +19,11 @@ DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
 ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
 
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
+
+from diagnostic_redaction import repo_relative_posix, sanitize_metadata, validate_metadata_redaction
+
 
 def current_commit_id() -> str:
     """Return the first 4 bytes (8 hex chars) of HEAD for stable per-commit diagnostics."""
@@ -500,7 +505,7 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = repo_relative_posix(str(DIAGNOSTIC_DIR / f"build-{commit_id}.logd"), ROOT)
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -538,6 +543,8 @@ def build_diagnostic_report(
 
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
+    report = sanitize_metadata(report, ROOT)
+    validate_metadata_redaction(report, ROOT)
     metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
 
@@ -703,8 +710,8 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [repo_relative_posix(str(path), ROOT) for path in logd_files]
+        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else repo_relative_posix(str(logd_path), ROOT)
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(

@@ -1,0 +1,41 @@
+{
+  "generated_at": "2026-07-01T07:19:07.148091+00:00",
+  "commit": "bf2147ac",
+  "diagnostic_logd": [
+    "diagnostic/build-bf2147ac-part001.logd",
+    "diagnostic/build-bf2147ac-part002.logd"
+  ],
+  "chunked": true,
+  "chunk_size_bytes": 41943040,
+  "password": "95c64f76adfb29120dc8",
+  "decrypt_command": "encryptly unpack diagnostic/build-bf2147ac.logd <outdir> --password 95c64f76adfb29120dc8",
+  "total_modules": 1,
+  "passed": 1,
+  "failed": 0,
+  "modules": [
+    {
+      "name": "compliance",
+      "status": "PASS",
+      "elapsed_seconds": 1.356,
+      "artifact": "compliance/build"
+    }
+  ],
+  "module_timings": [
+    {
+      "module": "compliance",
+      "language": "Java",
+      "command": [
+        "javac",
+        "-d",
+        "build",
+        "ComplianceAuditor.java"
+      ],
+      "started_at": "2026-07-01T07:14:24.764120+00:00",
+      "finished_at": "2026-07-01T07:14:26.120512+00:00",
+      "elapsed_seconds": 1.356,
+      "exit_code": 0,
+      "status": "PASS"
+    }
+  ],
+  "pr_note": "Include this metadata and diagnostic/build-bf2147ac-part001.logd, diagnostic/build-bf2147ac-part002.logd in your PR. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
