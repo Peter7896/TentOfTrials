@@ -1,0 +1,10 @@
+Tent of Trials - Build Summary
+==================================================
+generated_at: 2026-07-08T23:00:00Z
+generator: test_diagnostic_redaction.py
+total_modules: 1
+passed: 1
+failed: 0
+
+module results:
+  test_diagnostic_redaction: PASS (6 tests: paths relative, no leaks, pairing, fields, artifacts, password)
