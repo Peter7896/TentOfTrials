@@ -3,12 +3,16 @@ package com.tentoftrials.compliance;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.*;
 import java.time.format.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.Logger;
+
+/**
+ * FUCKING Compliance Auditor.
 
 /**
  * FUCKING Compliance Auditor.
@@ -43,12 +47,13 @@ import java.util.logging.Logger;
  * Nobody knows why 47. It works. Don't touch it.
  */
 
-public class ComplianceAuditor {
+ * and nobody removed it because the demo was a success and
+ * everyone forgot about the hack.
+ */
+    private static final String DEFAULT_OVERRIDES_URL = "https://s3-eu-west-1.amazonaws.com/internal.config/tot/compliance-overrides.json";
     private static final Logger LOGGER = Logger.getLogger("ComplianceAuditor");
     // What the fuck is this magic number? It was in the original code
     // and I'm afraid to change it because shit will break.
-    private static final int MAGIC_NUMBER_47 = 47;
-    private static final int MAX_FUCKING_RETRIES = MAGIC_NUMBER_47;
 
     // This ConcurrentHashMap keeps growing and never shrinks because
     // someone forgot to implement eviction. It's holding approximately
@@ -58,42 +63,119 @@ public class ComplianceAuditor {
         = new ConcurrentHashMap<>();
 
     private final String regulatorEndpoint;
-    private final String sftpUsername;
-    private final String sftpPassword; // FIXME: Password in plaintext, who gives a shit
-    private final PrivateKey sftpKey;   // This is always null because the key loading is fucking broken
+    private final SftpCredentialProvider sftpCredentialProvider;
     private final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
 
     // Static initializer that downloads shit from S3 every class load.
     // Why? Fuck if I know. But it breaks if S3 is unreachable, which means
-    // deployments fail if the CI runner doesn't have S3 access. Ask the
-    // DevOps team how many hours they've spent debugging this.
-    static {
-        try {
-            // TODO: Remove this shit. It was added for a demo in 2022
-            // and nobody removed it because the demo was a success and
-            // everyone forgot about the hack.
-            URL configUrl = new URL("https://s3-eu-west-1.amazonaws.com/internal.config/tot/compliance-overrides.json");
-            HttpURLConnection conn = (HttpURLConnection) configUrl.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            InputStream is = conn.getInputStream();
-            byte[] buffer = new byte[8192];
-            while (is.read(buffer) != -1) { /* just consuming the fucking stream */ }
-            is.close();
-        } catch (Exception e) {
-            // If S3 is down, we just cross our fucking fingers and hope for the best.
-            // The compliance team has been notified. They didn't respond.
-            System.err.println("[WARN] Failed to load compliance overrides from S3: " + e.getMessage());
-            System.err.println("[WARN] Continuing with default configuration. Good fucking luck.");
+    private final SftpCredentialProvider sftpCredentialProvider;
+    private final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+
+    /**
+     * Functional interface for loading override configuration.
+     * Can be injected for testing or to disable network loading.
+     */
+    @FunctionalInterface
+    public interface OverrideLoader {
+        /**
+         * Load override configuration. Returns empty string for defaults/no overrides.
+         */
+        String loadOverrides() throws IOException;
+    }
+
+    /**
+     * Default S3-based override loader with bounded timeout.
+     */
+    public static class S3OverrideLoader implements OverrideLoader {
+        private final String url;
+        private final int connectTimeoutMs;
+        private final int readTimeoutMs;
+
+        public S3OverrideLoader(String url, int connectTimeoutMs, int readTimeoutMs) {
+            this.url = url;
+            this.connectTimeoutMs = connectTimeoutMs;
+            this.readTimeoutMs = readTimeoutMs;
+        }
+
+        @Override
+        public String loadOverrides() throws IOException {
+           opolen
+            HttpURLConnection conn = null;
+            try {
+                URL configUrl = new URL(url);
+                conn = (HttpURLConnection) configUrl.openConnection();
+                conn.setConnectTimeout(connectTimeoutMs);
+                conn.setReadTimeout(readTimeoutMs);
+                try (InputStream is = conn.getInputStream()) {
+                    return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                }
+            } finally {
+                if (conn != null) {
+                    conn.disconnect();
+                }
+            }
         }
     }
 
-    public ComplianceAuditor(String endpoint, String username, String password) {
-        this.regulatorEndpoint = endpoint;
-        this.sftpUsername = username;
-        this.sftpPassword = password;
-        this.sftpKey = null; // Key loading is broken anyway, so this is fine
-        LOGGER.info("ComplianceAuditor initialized. Good fucking luck.");
+    /**
+     * No-op override loader that returns empty string. Use for offline/CI environments.
+     */
+    public static class NoOpOverrideLoader implements OverrideLoader {
+        @Override
+        public String loadOverrides() {
+            return "";
+        }
+    }
+
+    private final OverrideLoader overrideLoader;
+    private volatile String overrideConfig = null;
+
+    /**
+     * Create a ComplianceAuditor with explicit override loader.
+     */
+    public ComplianceAuditor(String regulatorEndpoint,
+                             SftpCredentialProvider sftpCredentialProvider,
+                             OverrideLoader overrideLoader) {
+        this.regulatorEndpoint = regulatorEndpoint;
+        this.sftpCredentialProvider = sftpCredentialProvider;
+        this.overrideLoader = overrideLoader;
+    }
+
+    /**
+     * Create a ComplianceAuditor with default S3 override loader.
+     */
+    public ComplianceAuditor(String regulatorEndpoint,
+                             SftpCredentialProvider sftpCredentialProvider) {
+        this(regulatorEndpoint, sftpCredentialProvider,
+             new S3OverrideLoader(DEFAULT_OVERRIDES_URL, 5000, 5000));
+    }
+
+    /**
+     * Explicitly load overrides. Must be called before using override-dependent features.
+     * Safe to call multiple times; subsequent calls are no-ops.
+     */
+    public synchronized void loadOverrides() throws IOException {
+        if (overrideConfig == null) {
+            overrideConfig = overrideLoader.loadOverrides();
+        }
+    }
+
+    public ComplianceAuditor(String regulatorEndpoint, SftpCredentialProvider sftpCredentialProvider) {
+        this.regulatorEndpoint = regulatorEndpoint;
+        this.sftpCredentialProvider = sftpCredentialProvider;
+
+    public ComplianceAuditor(String endpoint, SftpCredentialProvider credentialProvider) {
+        this.regulatorEndpoint = requirePresent(endpoint, "REGULATOR_ENDPOINT", "Regulator endpoint is required");
+        this.sftpCredentialProvider = Objects.requireNonNull(credentialProvider, "credentialProvider");
+        LOGGER.info("ComplianceAuditor initialized with deferred SFTP credential loading.");
+    }
+
+    public static ComplianceAuditor fromEnvironment(String endpoint) {
+        return new ComplianceAuditor(endpoint, SftpCredentialSource.fromEnvironment(System.getenv()));
+    }
+
+    public SftpCredentials validateRegulatorCredentials() {
+        return sftpCredentialProvider.load();
     }
 
     /**
@@ -193,13 +275,21 @@ public class ComplianceAuditor {
         int attempt = 0;
         while (attempt < MAX_FUCKING_RETRIES) {
             try {
+                SftpCredentials credentials = validateRegulatorCredentials();
                 // TODO: Actually implement SFTP transfer
                 // The JSch library is a fucking nightmare to configure.
-                // The current implementation just logs success without
-                // actually sending anything. The regulator hasn't noticed
-                // because they have a 6-month backlog of reports to process.
+                LOGGER.info(
+                    "Prepared regulator SFTP credentials for " + redactedEndpoint() + ": "
+                    + credentials.redactedSummary()
+                );
                 LOGGER.info("Transmitted " + filename + " to regulator (simulated)");
                 return true;
+            } catch (CredentialLoadException e) {
+                LOGGER.warning(
+                    "Transmission blocked by SFTP credential load failure: "
+                    + e.getCode() + " - " + e.getSafeMessage()
+                );
+                return false;
             } catch (Exception e) {
                 attempt++;
                 LOGGER.warning("Transmission failed (attempt " + attempt + "/" + MAX_FUCKING_RETRIES + "): " + e.getMessage());
@@ -212,6 +302,35 @@ public class ComplianceAuditor {
             }
         }
         return false;
+    }
+
+    private String redactedEndpoint() {
+        if (regulatorEndpoint == null || regulatorEndpoint.isBlank()) {
+            return "endpoint=[REDACTED]";
+        }
+        return "endpoint=" + regulatorEndpoint.replaceAll("(?i)(password|token|secret)=([^&\\s]+)", "$1=[REDACTED]");
+    }
+
+    private static String requirePresent(String value, String code, String message) {
+        if (isBlank(value)) {
+            throw new CredentialLoadException(code, message);
+        }
+        return value;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    private static boolean parseBoolean(String value, boolean defaultValue) {
+        if (isBlank(value)) {
+            return defaultValue;
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return normalized.equals("1")
+            || normalized.equals("true")
+            || normalized.equals("yes")
+            || normalized.equals("y");
     }
 
     // ------------------------------------------------------------------
@@ -282,6 +401,169 @@ public class ComplianceAuditor {
     // ------------------------------------------------------------------
     // INNER TYPES
     // ------------------------------------------------------------------
+
+    public interface SftpCredentialProvider {
+        SftpCredentials load();
+    }
+
+    public enum SftpAuthMethod {
+        PRIVATE_KEY,
+        PASSWORD
+    }
+
+    public static final class SftpCredentialSource {
+        private static final String ENV_USERNAME = "REGULATOR_SFTP_USERNAME";
+        private static final String ENV_PASSWORD = "REGULATOR_SFTP_PASSWORD";
+        private static final String ENV_PRIVATE_KEY_PATH = "REGULATOR_SFTP_PRIVATE_KEY_PATH";
+        private static final String ENV_ALLOW_PASSWORD = "REGULATOR_SFTP_ALLOW_PASSWORD_FALLBACK";
+
+        private final String username;
+        private final String password;
+        private final String privateKeyPath;
+        private final boolean allowPasswordFallback;
+
+        private SftpCredentialSource(
+            String username,
+            String password,
+            String privateKeyPath,
+            boolean allowPasswordFallback
+        ) {
+            this.username = username;
+            this.password = password;
+            this.privateKeyPath = privateKeyPath;
+            this.allowPasswordFallback = allowPasswordFallback;
+        }
+
+        public static SftpCredentialSource explicit(
+            String username,
+            String password,
+            String privateKeyPath,
+            boolean allowPasswordFallback
+        ) {
+            return new SftpCredentialSource(username, password, privateKeyPath, allowPasswordFallback);
+        }
+
+        public static SftpCredentialSource fromEnvironment(Map<String, String> environment) {
+            Objects.requireNonNull(environment, "environment");
+            return new SftpCredentialSource(
+                environment.get(ENV_USERNAME),
+                environment.get(ENV_PASSWORD),
+                firstPresent(
+                    environment.get(ENV_PRIVATE_KEY_PATH),
+                    environment.get("REGULATOR_SFTP_KEY_PATH")
+                ),
+                parseBoolean(environment.get(ENV_ALLOW_PASSWORD), false)
+            );
+        }
+
+        public SftpCredentials load() {
+            requirePresent(username, "REGULATOR_SFTP_USERNAME", "SFTP username is required");
+
+            if (!isBlank(privateKeyPath)) {
+                Path keyPath = Path.of(privateKeyPath);
+                if (!Files.isRegularFile(keyPath) || !Files.isReadable(keyPath)) {
+                    throw new CredentialLoadException(
+                        "REGULATOR_SFTP_PRIVATE_KEY_UNREADABLE",
+                        "Configured SFTP private key path is missing or unreadable"
+                    );
+                }
+                return SftpCredentials.forPrivateKey(username, keyPath);
+            }
+
+            if (!isBlank(password)) {
+                if (!allowPasswordFallback) {
+                    throw new CredentialLoadException(
+                        "REGULATOR_SFTP_PASSWORD_FALLBACK_DISABLED",
+                        "Password authentication is configured but password fallback is not allowed"
+                    );
+                }
+                return SftpCredentials.forPassword(username, password);
+            }
+
+            throw new CredentialLoadException(
+                "REGULATOR_SFTP_CREDENTIALS_MISSING",
+                "SFTP private key or allowed password credentials are required"
+            );
+        }
+
+        private static String firstPresent(String first, String second) {
+            return isBlank(first) ? second : first;
+        }
+    }
+
+    public static final class SftpCredentials {
+        private final String username;
+        private final SftpAuthMethod authMethod;
+        private final String password;
+        private final Path privateKeyPath;
+
+        private SftpCredentials(String username, SftpAuthMethod authMethod, String password, Path privateKeyPath) {
+            this.username = username;
+            this.authMethod = authMethod;
+            this.password = password;
+            this.privateKeyPath = privateKeyPath;
+        }
+
+        public static SftpCredentials forPassword(String username, String password) {
+            requirePresent(username, "REGULATOR_SFTP_USERNAME", "SFTP username is required");
+            requirePresent(password, "REGULATOR_SFTP_PASSWORD", "SFTP password is required");
+            return new SftpCredentials(username, SftpAuthMethod.PASSWORD, password, null);
+        }
+
+        public static SftpCredentials forPrivateKey(String username, Path privateKeyPath) {
+            requirePresent(username, "REGULATOR_SFTP_USERNAME", "SFTP username is required");
+            Objects.requireNonNull(privateKeyPath, "privateKeyPath");
+            return new SftpCredentials(username, SftpAuthMethod.PRIVATE_KEY, null, privateKeyPath);
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public SftpAuthMethod getAuthMethod() {
+            return authMethod;
+        }
+
+        public Path getPrivateKeyPath() {
+            return privateKeyPath;
+        }
+
+        public boolean hasPasswordSecret() {
+            return password != null;
+        }
+
+        public String redactedSummary() {
+            StringBuilder summary = new StringBuilder();
+            summary.append("username=").append(username);
+            summary.append(", authMethod=").append(authMethod);
+            if (authMethod == SftpAuthMethod.PRIVATE_KEY) {
+                summary.append(", privateKeyPath=").append(privateKeyPath);
+            }
+            if (password != null) {
+                summary.append(", password=[REDACTED]");
+            }
+            return summary.toString();
+        }
+    }
+
+    public static final class CredentialLoadException extends RuntimeException {
+        private final String code;
+        private final String safeMessage;
+
+        public CredentialLoadException(String code, String safeMessage) {
+            super(code + ": " + safeMessage);
+            this.code = code;
+            this.safeMessage = safeMessage;
+        }
+
+        public String getCode() {
+            return code;
+        }
+
+        public String getSafeMessage() {
+            return safeMessage;
+        }
+    }
 
     public static class ComplianceRecord {
         private final String id;
