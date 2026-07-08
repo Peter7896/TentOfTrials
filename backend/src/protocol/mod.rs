@@ -136,6 +136,7 @@ pub fn is_version_supported(version: u32) -> bool {
 pub mod frame;
 pub mod validate;
 
-pub use frame::*;
-pub use validate::*;
+// Re-export commonly used types
+pub use frame::{FrameCodec, FrameDecoder, FrameEncoder};
+pub use validate::{validate_frame, ValidationError};
 }
