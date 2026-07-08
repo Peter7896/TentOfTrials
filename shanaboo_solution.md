@@ -1,177 +1,184 @@
  ```diff
---- a/build.py
-+++ b/build.py
-@@ -1,5 +1,6 @@
- #!/usr/bin/env python3
- 
-+import errno
- import argparse
- import datetime
- import getpass
-@@ -12,6 +13,7 @@
- import sys
- import time
- import traceback
-+import tempfile
- from dataclasses import dataclass
- from pathlib import Path
- from typing import Optional
-@@ -22,6 +24,7 @@
- ENCRYPTLY_BLOCKER_MESSAGE = "encryptly could not create an archive. You may have timed out; try launching it in the background and waiting for it to finish with no timeout due to a bug in encryptly."
- 
- 
+--- a/backend/src/protocol/frame.rs
++++ b/backend/src/protocol/frame.rs
+@@ -0,0 +1,0 @@
++// Protocol frame codec with recovery support
 +
- def current_commit_id() -> str:
-     """Return the first 4 bytes (8 hex chars) of HEAD for stable per-commit diagnostics."""
-     try:
-@@ -39,6 +42,7 @@ def current_commit_id() -> str:
-     return "00000000"
- 
- 
++use bytes::{Buf, BytesMut};
++use std::fmt;
++use thiserror::Error;
 +
- def diagnostic_paths_for_commit() -> tuple[Path, Path, str]:
-     """Return stable diagnostic artifact paths under diagnostic/ for the current commit."""
-     DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
-@@ -48,6 +52,7 @@ def diagnostic_paths_for_commit() -> tuple[Path, Path, str]:
-     return logd_path, metadata_path, commit_id
- 
- 
++/// Maximum allowed frame size to prevent memory exhaustion
++pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB
 +
- def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SIZE) -> list[Path]:
-     """Split an oversized .logd into numbered .logd chunksctd chunks and remove the original."""
-     if logd_path.stat().st_size <= chunk_size:
-@@ -69,6 +74,7 @@ def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SI
-     return chunks
- 
- 
++/// Protocol version
++pub const PROTOCOL_VERSION: u8 = 1;
 +
- @dataclass
- class Module:
-     name: str
-@@ -79,6 +85,7 @@ class Module:
-     build_dir: Optional[Path] = None
-     env: Optional[dict[str, str]] = None
- 
++/// Frame header structure:
++/// - Magic (2 bytes): 0x54 0x4F ("TO")
++/// - Version (1 byte)
++/// - Flags (1 byte)
++/// - Reserved (2 bytes, must be 0)
++/// - Length (4 bytes, big-endian)
++/// - Checksum (4 bytes, simple XOR-based)
++pub const HEADER_SIZE: usize = 14;
 +
- MODULES = [
-     Module(
-         name="backend",
-@@ -141,6 +148,7 @@ class Module:
-     ),
- ]
- 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Frame {
++    pub version: u8,
++    pub flags: u8,
++    pub payload: Vec<u8>,
++}
 +
- def run_command(
-     cmd: list[str],
-     cwd: Path,
-@@ -149,6 +157,7 @@ def run_command(
-     env: Optional[dict[str, str]] = None,
-     timeout: Optional[int] = None,
-     check: bool = True,
-+    log_prefix: str = "",
- ) -> subprocess.CompletedProcess:
-     """Run a shell command with optional timeout and environment overrides."""
-     merged_env = os.environ.copy()
-@@ -157,6 +166,7 @@ def run_command(
- 
-     start = time.monotonic()
-     try:
-+        _log_diagnostic(f"{log_prefix}Running: {' '.join(shlex.quote(c) for c in cmd)}")
-         proc = subprocess.run(
-             cmd,
-             cwd=str(cwd),
-@@ -167,6 +177,7 @@ def run_command(
-             timeout=timeout,
-             env=merged_env,
-         )
-+        _log_diagnostic(f"{log_prefix}Completed in {time.monotonic() - start:.2f}s (returncode={proc.returncode})")
-         if check and proc.returncode != 0:
-             raise subprocess.CalledProcessError(
-                 proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr
-@@ -174,12 +185,14 @@ def run_command(
-         return proc
-     except subprocess.TimeoutExpired as exc:
-         elapsed = time.monotonic() - start
-+        _log_diagnostic(f"{log_prefix}Command timed out after {elapsed:.2f}s: {' '.join(shlex.quote(c) for c in cmd)}")
-         raise subprocess.TimeoutExpired(
-             cmd=cmd, timeout=timeout, output=exc.output, stderr=exc.stderr
-         ) from exc
-     except FileNotFoundError as exc:
-         # Provide a clearer error when the executable is missing
-         missing = cmd[0] if cmd else "<unknown>"
-+        _log_diagnostic(f"{log_prefix}Command not found: {missing}")
-         raise FileNotFoundError(
-             f"Required command '{missing}' not found in PATH. "
-             f"Please ensure it is installed and available."
-@@ -187,6 +200,7 @@ def run_command(
-     except subprocess.CalledProcessError as exc:
-         # Re-raise with stderr included for better diagnostics
-         if exc.stderr:
-+            _log_diagnostic(f"{log_prefix}Command failed with stderr: {exc.stderr[:500]}")
-             raise subprocess.CalledProcessError(
-                 exc.returncode,
-                 exc.cmd,
-@@ -196,6 +210,7 @@ def run_command(
-         raise
- 
- 
++impl Frame {
++    pub fn new(payload: Vec<u8>) -> Self {
++        Self {
++            version: PROTOCOL_VERSION,
++            flags: 0,
++            payload,
++        }
++    }
++}
 +
- def encrypt_log(
-     log_path: Path,
-     password: str,
-@@ -204,6 +219,7 @@ def encrypt_log(
-     Encrypt a log file using encryptly and return the path to the encrypted .logd file.
-     Raises RuntimeError if encryption fails.
-     """
-+    _log_diagnostic(f"Encrypting log: {log_path} -> {output_path}")
-     proc = run_command(
-         ["encryptly", "encrypt", str(log_path), "--password", password, "--output", str(output_path)],
-         cwd=ROOT,
-@@ -213,6 +229,7 @@ def encrypt_log(
-     return output_path
- 
- 
++#[derive(Error, Debug, Clone, PartialEq, Eq)]
++pub enum FrameError {
++    #[error("insufficient data: need {needed}, have {have}")]
++    InsufficientData { needed: usize, have: usize },
++    
++    #[error("invalid magic bytes: expected [0x54, 0x4F], got {0:?}")]
++    InvalidMagic([u8; 2]),
++    
++    #[error("unsupported protocol version: {0}")]
++    UnsupportedVersion(u8),
++    
++    #[error("invalid reserved bytes: expected [0x00, 0x00], got {0:?}")]
++    InvalidReserved([u8; 2]),
++    
++    #[error("frame length exceeds maximum: {length} > {max}")]
++    FrameTooLarge { length: u32, max: u32 },
++    
++    #[error("checksum mismatch: expected {expected:#04x}, computed {computed:#04x}")]
++    ChecksumMismatch { expected: u32, computed: u32 },
++    
++    #[error("truncated payload: expected {expected} bytes, have {have}")]
++    TruncatedPayload { expected: usize, have: usize },
++}
 +
- def decrypt_log(
-     logd_path: Path,
-     password: str,
-@@ -221,6 +238,7 @@ def decrypt_log(
-     Decrypt a .logd file using encryptly and return the path to the decrypted log file.
-     Raises RuntimeError if decryption fails.
-     """
-+    _log_diagnostic(f"Decrypting log: {logd_path} -> {output_path}")
-     proc = run_command(
-         ["encryptly", "decrypt", str(logd_path), "--password", password, "--output", str(output_path)],
-         cwd=ROOT,
-@@ -230,6 +248,7 @@ def decrypt_log(
-     return output_path
- 
- 
++/// Compute simple XOR checksum over data
++fn compute_checksum(data: &[u8]) -> u32 {
++    let mut checksum: u32 = 0;
++    for chunk in data.chunks(4) {
++        let mut word = [0u8; 4];
++        word[..chunk.len()].copy_from_slice(chunk);
++        checksum ^= u32::from_be_bytes(word);
++    }
++    checksum
++}
 +
- def generate_password() -> str:
-     """Generate a random password for diagnostic encryption."""
-     import secrets
-@@ -237,6 +256,7 @@ def generate_password() -> str:
-     return secrets.token_urlsafe(32)
- 
- 
++/// Build a complete frame into a byte buffer
++pub fn encode_frame(frame: &Frame, dst: &mut BytesMut) {
++    let length = frame.payload.len() as u32;
++    let mut header = [0u8; HEADER_SIZE];
++    
++    // Magic
++    header[0] = 0x54;
++    header[1] = 0x4F;
++    // Version
++    header[2] = frame.version;
++    // Flags
++    header[3] = frame.flags;
++    // Reserved (must be 0)
++    header[4] = 0;
++    header[5] = 0;
++    // Length (big-endian)
++    header[6..10].copy_from_slice(&length.to_be_bytes());
++    
++    // Checksum over header (without checksum field) + payload
++    let checksum = compute_checksum(&header[..10]);
++    let payload_checksum = compute_checksum(&frame.payload);
++    let total_checksum = checksum ^ payload_checksum;
++    header[10..14].copy_from_slice(&total_checksum.to_be_bytes());
++    
++    dst.extend_from_slice(&header);
++    dst.extend_from_slice(&frame.payload);
++}
 +
- def build_module(module: Module, release: bool = False) -> dict:
-     """Build a single module and return result metadata."""
-     print(f"Building {module.name} ({module.language})...")
-@@ -248,6 +268,7 @@ def build_module(module: Module, release: bool = False) -> dict:
-     return result
- 
- 
++/// Decode a frame from a byte buffer with state preservation on error
++pub struct FrameDecoder {
++    /// Number of successfully decoded frames
++    frames_decoded: u64,
++    /// Number of failed decode attempts
++    frames_failed: u64,
++    /// Whether we're currently mid-decode (for state tracking)
++    decoding: bool,
++}
 +
- def clean_module(module: Module) -> dict:
-     """Clean a single module and return result metadata."""
-     print(f"Cleaning {module.name} ({module.language})...")
-@@ -259,6 +280,7 @@ def clean_module(module: Module) -> dict:
-     return result
- 
- 
++impl Default for FrameDecoder {
++    fn default() -> Self {
++        Self::new()
++    }
++}
 +
- def run_module_tests(module: Module) -> dict:
-     """Run tests for a single module and return result metadata."""
-     print(f"
++impl FrameDecoder {
++    pub fn new() -> Self {
++        Self {
++            frames_decoded: 0,
++            frames_failed: 0,
++            decoding: false,
++        }
++    }
++    
++    pub fn frames_decoded(&self) -> u64 {
++        self.frames_decoded
++    }
++    
++    pub fn frames_failed(&self) -> u64 {
++        self.frames_failed
++    }
++    
++    /// Attempt to decode a frame from the buffer.
++    /// On success, consumes the frame bytes and returns the frame.
++    /// On error, preserves buffer state (does not consume bytes).
++    pub fn decode(&mut self, src: &mut BytesMut) -> Result<Frame, FrameError> {
++        self.decoding = true;
++        
++        let result = self.try_decode(src);
++        
++        match &result {
++            Ok(_) => {
++                self.frames_decoded += 1;
++                self.decoding = false;
++            }
++            Err(_) => {
++                self.frames_failed += 1;
++                // Don't reset decoding flag - we're still in a valid state
++                self.decoding = false;
++            }
++        }
++        
++        result
++    }
++    
++    fn try_decode(&self, src: &mut BytesMut) -> Result<Frame, FrameError> {
++        // Check for complete header
++        if src.len() < HEADER_SIZE {
++            return Err(FrameError::InsufficientData {
++                needed: HEADER_SIZE,
++                have: src.len(),
++            });
++        }
++        
++        // Parse header without consuming yet
++        let magic = [src[0], src[1]];
++        if magic != [0x54, 0x4F] {
++            return Err(FrameError::InvalidMagic(magic));
++        }
++        
++        let version = src[2];
++        if version != PROTOCOL_VERSION {
++            return Err(FrameError::UnsupportedVersion(version));
++        }
++        
++        let flags = src[3];
++        
++        let
