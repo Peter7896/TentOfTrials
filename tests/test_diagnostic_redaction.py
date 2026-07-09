@@ -10,6 +10,7 @@ These tests validate that:
 Run:  python3 -m pytest tests/test_diagnostic_redaction.py -v
 """
 
+import platform
 import sys
 import tempfile
 from pathlib import Path
@@ -136,7 +137,6 @@ def test_collect_system_info_does_not_leak_repo_path():
 def test_collect_system_info_no_machine_name_leak_in_paths():
     """Machine hostname should not appear as a directory path component."""
     from build import collect_system_info
-    import platform
 
     info = collect_system_info()
     hostname = platform.node()
