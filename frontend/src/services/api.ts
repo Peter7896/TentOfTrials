@@ -234,6 +234,28 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
+      // --- FIX: Normalize non-2xx responses into ApiError ---
+      if (!response.ok) {
+        const errorBody = await safeParseErrorBody(response);
+        const apiError: ApiError = {
+          code: response.status,
+          message: errorBody.message || response.statusText || 'Request failed',
+          details: errorBody.details,
+          requestId: response.headers.get('X-Request-ID') || undefined,
+          path: path,
+          suggestion: errorBody.suggestion || getDefaultSuggestion(response.status),
+        };
+
+        // Run through error interceptor chain
+        let processedError = apiError;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+
+        throw processedError;
+      }
+      // --- END FIX ---
+
       const responseData = await parseResponse<T>(response);
 
       // Apply response interceptors
@@ -244,6 +266,14 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      // If already an ApiError (from non-2xx handling above), re-throw immediately.
+      // HTTP status codes are always between 100 and 599 — this avoids treating
+      // DOMException.code (e.g. ABORT_ERR = 20) as an HTTP status.
+      const errCode = (error as any)?.code;
+      if (typeof errCode === 'number' && errCode >= 100 && errCode < 600) {
+        throw error;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -263,6 +293,60 @@ async function request<T>(
   }
 
   throw processedError;
+}
+
+/**
+ * Safely parse an error response body into structured fields.
+ * Handles JSON error bodies, text errors, and empty responses.
+ */
+async function safeParseErrorBody(response: Response): Promise<{
+  message?: string;
+  details?: Record<string, unknown>;
+  suggestion?: string;
+}> {
+  const contentType = response.headers.get('content-type') || '';
+  const cloned = response.clone();
+
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await cloned.json();
+      if (body && typeof body === 'object') {
+        return {
+          message: typeof body.message === 'string' ? body.message
+            : typeof body.error === 'string' ? body.error
+            : typeof body.error?.message === 'string' ? body.error.message
+            : undefined,
+          details: body.details || body.errors || undefined,
+          suggestion: typeof body.suggestion === 'string' ? body.suggestion : undefined,
+        };
+      }
+    }
+  } catch {
+    // JSON parse failed, try as text
+  }
+
+  try {
+    const text = await cloned.text();
+    if (text) {
+      return { message: text };
+    }
+  } catch {
+    // Text read failed
+  }
+
+  return {};
+}
+
+/**
+ * Returns a user-facing suggestion based on the HTTP status code.
+ */
+function getDefaultSuggestion(status: number): string | undefined {
+  if (status === 401) return 'Your session may have expired. Please try logging in again.';
+  if (status === 403) return 'You do not have permission to perform this action.';
+  if (status === 404) return 'The requested resource was not found.';
+  if (status === 429) return 'Too many requests. Please wait a moment and try again.';
+  if (status >= 500) return 'The server encountered an error. Please try again later.';
+  return undefined;
 }
 
 function buildUrl(path: string, params?: QueryParams): string {
