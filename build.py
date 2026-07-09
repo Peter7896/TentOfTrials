@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -169,6 +170,7 @@ ENCRYPTLY_BINARIES = {
     "linux-x64": ENCRYPTLY_DIR / "linux-x64" / "encryptly",
     "linux-arm64": ENCRYPTLY_DIR / "linux-arm64" / "encryptly",
     "macos-arm64": ENCRYPTLY_DIR / "macos-arm64" / "encryptly",
+    "macos-x64": ENCRYPTLY_DIR / "macos-x64" / "encryptly",
     "windows-x64": ENCRYPTLY_DIR / "windows-x64" / "encryptly.exe",
     "windows-arm64": ENCRYPTLY_DIR / "windows-arm64" / "encryptly.exe",
 }
@@ -276,6 +278,83 @@ def color(text: str, code: str) -> str:
     if not sys.stdout.isatty():
         return text
     return f"{code}{text}{Colors.RESET}"
+
+
+def repo_relative(path: Path) -> str:
+    """Return a repository-relative path with POSIX separators for metadata."""
+    return path.relative_to(ROOT).as_posix()
+
+
+def _redaction_values() -> list[tuple[str, str]]:
+    values: list[tuple[str, str]] = []
+    candidates = [
+        (str(ROOT), "<repo>"),
+        (str(Path.home()), "<home>"),
+        (tempfile.gettempdir(), "<temp>"),
+        (getpass.getuser(), "<user>"),
+        (platform.node(), "<host>"),
+    ]
+    for raw, replacement in candidates:
+        if raw:
+            values.append((raw, replacement))
+            if os.sep != "/":
+                values.append((raw.replace(os.sep, "/"), replacement))
+    return sorted(values, key=lambda item: len(item[0]), reverse=True)
+
+
+def redact_metadata_text(value: str) -> str:
+    redacted = value
+    for needle, replacement in _redaction_values():
+        redacted = redacted.replace(needle, replacement)
+    return redacted
+
+
+def metadata_path_value(value: Optional[str]) -> Optional[str]:
+    """Normalize artifact paths for JSON metadata without leaking local paths."""
+    if value is None:
+        return None
+    try:
+        path = Path(value).resolve()
+        return repo_relative(path)
+    except Exception:
+        return redact_metadata_text(value)
+
+
+def validate_diagnostic_metadata(metadata_path: Path, root: Path = ROOT) -> list[str]:
+    """Return clear validation errors for diagnostic JSON/logd pairing."""
+    errors: list[str] = []
+    if not metadata_path.exists():
+        return [f"diagnostic metadata is missing: {metadata_path}"]
+
+    try:
+        report = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"diagnostic metadata is not valid JSON: {exc}"]
+
+    diagnostic_logd = report.get("diagnostic_logd")
+    if not diagnostic_logd:
+        if report.get("diagnostic_logd_error"):
+            return errors
+        return ["diagnostic metadata is missing diagnostic_logd"]
+
+    logd_entries = diagnostic_logd if isinstance(diagnostic_logd, list) else [diagnostic_logd]
+    for entry in logd_entries:
+        if not isinstance(entry, str):
+            errors.append(f"diagnostic_logd entry is not a string: {entry!r}")
+            continue
+        if "\\" in entry:
+            errors.append(f"diagnostic_logd must use '/' separators: {entry}")
+        if Path(entry).is_absolute():
+            errors.append(f"diagnostic_logd must be repository-relative: {entry}")
+            continue
+        logd_path = root / entry
+        if not logd_path.exists():
+            errors.append(f"diagnostic .logd artifact is missing: {entry}")
+        if logd_path.suffix != ".logd":
+            errors.append(f"diagnostic artifact is not a .logd file: {entry}")
+
+    return errors
+
 
 def check_prerequisites() -> list[str]:
     required = {
@@ -500,7 +579,7 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = repo_relative(DIAGNOSTIC_DIR / f"build-{commit_id}.logd")
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -523,8 +602,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": metadata_path_value(binary),
+                "output": redact_metadata_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -539,7 +618,7 @@ def build_diagnostic_report(
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
     metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
+    print(f"    {color('✓', Colors.GREEN)} {repo_relative(metadata_path)} created")
 
 
 def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
@@ -549,7 +628,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         print(f"    {color('✗', Colors.RED)} No diagnostic artifacts found to commit")
         return False
 
-    relpaths = [str(path.relative_to(ROOT)) for path in existing]
+    relpaths = [repo_relative(path) for path in existing]
     status = subprocess.run(
         ["git", "status", "--porcelain", "--", *relpaths],
         cwd=str(ROOT),
@@ -703,8 +782,8 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [repo_relative(path) for path in logd_files]
+        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else repo_relative(logd_path)
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
@@ -719,7 +798,7 @@ def generate_logd(
         for path in logd_files:
             size_kb = path.stat().st_size / 1024.0
             print(
-                f"    {color('✓', Colors.GREEN)} {path.relative_to(ROOT)} created "
+                f"    {color('✓', Colors.GREEN)} {repo_relative(path)} created "
                 f"({size_kb:.1f} KiB)"
             )
         if len(logd_files) > 1:
@@ -737,7 +816,7 @@ def generate_logd(
             print(f"             diagnostic log file(s) and metadata file with this password.")
             if len(logd_files) > 1:
                 print(f"             Reassemble chunks in order before unpacking:")
-                print(f"             cat {' '.join(logd_relpaths)} > {logd_path.relative_to(ROOT)}")
+                print(f"             cat {' '.join(logd_relpaths)} > {repo_relative(logd_path)}")
             print(f"  {color(safe_pw, Colors.CYAN)}")
             print(f"  {color(f'encryptly unpack {decrypt_target} <outdir> --password {safe_pw}', Colors.GRAY)}")
         return True
