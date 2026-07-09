@@ -5,7 +5,7 @@
 // formats and handles framing, checksums, and optional encryption.
 //
 // The wire format consists of:
-//   1. Frame header (24 bytes) - magic, version, type, flags, length, sequence
+//   1. Frame header (20 bytes) - magic, version, type, flags, length, sequence, reserved
 //   2. Frame payload (variable) - serialized message data
 //   3. Optional checksum (4 bytes) - CRC32C if PROTOCOL_FLAG_CHECKSUMED is set
 //
@@ -33,7 +33,7 @@ use std::io::{Cursor, Read, Write};
 pub const FRAME_MAGIC: u32 = 0x544F5446;
 
 /// Size of the frame header in bytes.
-pub const FRAME_HEADER_SIZE: usize = 24;
+pub const FRAME_HEADER_SIZE: usize = 20;
 
 /// Maximum frame payload size (16 MB).
 pub const FRAME_MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -389,5 +389,200 @@ mod tests {
         decoder.feed(&encoded);
         let result = decoder.decode();
         assert!(matches!(result, Err(ProtocolError::ChecksumMismatch)));
+    }
+
+    // ---- Recovery tests: malformed input does not corrupt decoder state ----
+
+    #[test]
+    fn test_truncated_header_returns_none() {
+        // Header is 24 bytes; feed only 10 bytes
+        let mut decoder = FrameDecoder::new();
+        let partial = vec![0u8; 10];
+        decoder.feed(&partial);
+        // Should return Ok(None) without panicking
+        let result = decoder.decode();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        // State should be preserved for more data
+        assert_eq!(decoder.buffered_bytes(), 10);
+    }
+
+    #[test]
+    fn test_truncated_payload_returns_none() {
+        // Encode a valid frame header but truncate the payload
+        let frame = Frame::new(0x01, b"payload data".to_vec());
+        let mut encoded = FrameEncoder::encode(&frame).unwrap();
+        encoded.truncate(FRAME_HEADER_SIZE + 3); // only 3 bytes of payload
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        // Should return Ok(None) — not enough data
+        let result = decoder.decode();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        // Buffer still holds the partial frame
+        assert!(decoder.buffered_bytes() > 0);
+    }
+
+    #[test]
+    fn test_invalid_frame_length_returns_error() {
+        let mut decoder = FrameDecoder::new();
+
+        // Craft a header with an impossibly large payload length
+        let mut header = vec![];
+        header.extend_from_slice(&FRAME_MAGIC.to_be_bytes());       // magic
+        header.push(PROTOCOL_VERSION as u8);                        // version
+        header.push(0x01);                                          // type
+        header.extend_from_slice(&FLAG_NONE.to_be_bytes());         // flags
+        // Set payload length beyond MAX (16 MB + 1)
+        let huge_len: u32 = (FRAME_MAX_PAYLOAD_SIZE + 1) as u32;
+        header.extend_from_slice(&huge_len.to_be_bytes());
+        header.extend_from_slice(&0u32.to_be_bytes());              // sequence
+        header.extend_from_slice(&[0u8; 4]);                        // reserved
+
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::MessageTooLarge)));
+    }
+
+    #[test]
+    fn test_invalid_magic_returns_error() {
+        let mut decoder = FrameDecoder::new();
+
+        // Feed data with wrong magic number, then valid frame afterward
+        let mut bad = vec![0xFF, 0xFF, 0xFF, 0xFF]; // wrong magic
+        bad.extend_from_slice(&[0u8; 20]); // rest of header
+        let good_frame = Frame::new(0x01, b"valid".to_vec());
+        let good_encoded = FrameEncoder::encode(&good_frame).unwrap();
+
+        // Feed bad + good together
+        decoder.feed(&bad);
+        let result = decoder.decode();
+        // Bad magic should clear buffer and return error
+        assert!(matches!(result, Err(ProtocolError::InvalidMessage)));
+        // Buffer should have been cleared
+        assert_eq!(decoder.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_invalid_version_returns_error() {
+        let mut decoder = FrameDecoder::new();
+
+        let mut header = vec![];
+        header.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        header.push(0x01);  // version 1 — below MIN_COMPATIBLE_VERSION (2)
+        header.push(0x01);  // type
+        header.extend_from_slice(&FLAG_NONE.to_be_bytes());
+        header.extend_from_slice(&0u32.to_be_bytes());  // zero-length payload
+        header.extend_from_slice(&0u32.to_be_bytes());  // sequence
+        header.extend_from_slice(&[0u8; 4]);             // reserved
+
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::UnsupportedVersion)));
+    }
+
+    #[test]
+    fn test_recovery_after_invalid_input() {
+        // Send invalid frame, then valid frame — valid frame should decode
+        let mut decoder = FrameDecoder::new();
+
+        // Invalid: wrong version
+        let mut bad = vec![];
+        bad.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
+        bad.push(0x01);  // bad version
+        bad.push(0x01);
+        bad.extend_from_slice(&FLAG_NONE.to_be_bytes());
+        bad.extend_from_slice(&0u32.to_be_bytes());
+        bad.extend_from_slice(&0u32.to_be_bytes());
+        bad.extend_from_slice(&[0u8; 4]);
+
+        // Valid frame
+        let good_frame = Frame::new(0x01, b"recovered".to_vec());
+        let good_encoded = FrameEncoder::encode(&good_frame).unwrap();
+
+        // Feed bad, decode (fails and clears buffer), then feed good
+        decoder.feed(&bad);
+        let bad_result = decoder.decode();
+        assert!(bad_result.is_err());
+        assert_eq!(decoder.buffered_bytes(), 0);
+
+        // Now feed and decode the valid frame
+        decoder.feed(&good_encoded);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"recovered");
+        assert_eq!(decoder.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_decode_all_collects_all_frames() {
+        let frames = vec![
+            Frame::new(0x01, b"first".to_vec()),
+            Frame::new(0x02, b"second".to_vec()),
+            Frame::new(0x03, b"third".to_vec()),
+        ];
+        let encoded = FrameEncoder::encode_stream(frames.iter()).unwrap();
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let all = decoder.decode_all().unwrap();
+
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].payload, b"first");
+        assert_eq!(all[1].payload, b"second");
+        assert_eq!(all[2].payload, b"third");
+    }
+
+    #[test]
+    fn test_decoder_state_after_failed_decode() {
+        // Decoder state (frame counter, partial frame tracking) should not
+        // be corrupted by a failed decode.
+        let mut decoder = FrameDecoder::new();
+
+        // Invalid: bad checksum
+        let frame = Frame::new(0x01, b"data".to_vec()).with_checksum();
+        let mut encoded = FrameEncoder::encode(&frame).unwrap();
+        encoded[FRAME_HEADER_SIZE] ^= 0xFF; // corrupt payload
+
+        decoder.feed(&encoded);
+        let result = decoder.decode();
+        assert!(result.is_err());
+
+        // Decoder should be in a clean state after the error
+        // (buffer drained, partial_frame cleared)
+        assert_eq!(decoder.buffered_bytes(), 0);
+
+        // Now decode a valid frame
+        let good_frame = Frame::new(0x01, b"after error".to_vec());
+        let good_encoded = FrameEncoder::encode(&good_frame).unwrap();
+        decoder.feed(&good_encoded);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"after error");
+    }
+
+    #[test]
+    fn test_decoder_reset_preserves_future_decode() {
+        let decoder = FrameDecoder::new();
+
+        // Reset touchpoints: partial_frame and buffer
+        let frame = Frame::new(0x01, b"reset test".to_vec());
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+
+        // Decode once
+        let mut decoder = decoder;
+        decoder.feed(&encoded);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"reset test");
+
+        // Reset
+        decoder.reset();
+        assert_eq!(decoder.buffered_bytes(), 0);
+
+        // Decode again after reset
+        let frame2 = Frame::new(0x02, b"after reset".to_vec());
+        let encoded2 = FrameEncoder::encode(&frame2).unwrap();
+        decoder.feed(&encoded2);
+        let decoded2 = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded2.payload, b"after reset");
     }
 }
