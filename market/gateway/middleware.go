@@ -38,12 +38,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -377,31 +373,10 @@ func CompressMiddleware(next http.Handler) http.Handler {
 // HELPERS
 // ---------------------------------------------------------------------------
 
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
 func generateUUID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func generateAPIKey() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return base64.URLEncoding.EncodeToString(b)
 }
 
 func extractToken(r *http.Request) string {
@@ -415,7 +390,10 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
-func validateToken(token string) (string, string, error) {
+// validateToken is a package-level variable to allow test injection.
+// The default implementation is a stub that accepts any token.
+// Replace in tests to simulate authentication failures.
+var validateToken = func(token string) (string, string, error) {
 	// TODO: Implement actual token validation against auth service
 	// This is a stub that accepts any token and returns a fake user ID.
 	// The real implementation should:
@@ -428,8 +406,4 @@ func validateToken(token string) (string, string, error) {
 	return "user_stub", "session_stub", nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
+// writeJSON is declared in api.go (same package).
