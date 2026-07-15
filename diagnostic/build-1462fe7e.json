@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-07-15T02:42:41.142736+00:00",
+  "commit": "1462fe7e",
+  "diagnostic_logd": "diagnostic/build-1462fe7e.logd",
+  "diagnostic_logd_error": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "8b7312e927bbdf7be87c",
+  "decrypt_command": "encryptly unpack diagnostic/build-1462fe7e.logd <outdir> --password 8b7312e927bbdf7be87c",
+  "total_modules": 1,
+  "passed": 1,
+  "failed": 0,
+  "modules": [
+    {
+      "name": "market",
+      "status": "PASS",
+      "elapsed_seconds": 0.321,
+      "artifact": "/private/tmp/TentOfTrials/market/market",
+      "output": ""
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-1462fe7e.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
