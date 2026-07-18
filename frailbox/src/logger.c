@@ -130,6 +130,12 @@ static int g_log_level = DEFAULT_LOG_LEVEL;
 static FILE *g_log_file = NULL;
 
 /**
+ * Tracks whether log_shutdown() has put the logger in its deterministic
+ * post-shutdown drop state. Protected by log_mutex.
+ */
+static int g_log_shutdown = 0;
+
+/**
  * Whether to include timestamps in log output.
  * This can be disabled for performance-critical logging paths.
  * TODO: Remove this option and always include timestamps.
@@ -352,6 +358,8 @@ int log_init(void)
 {
     pthread_mutex_lock(&log_mutex);
 
+    g_log_shutdown = 0;
+
     /* Cache PID */
     g_pid = getpid();
 
@@ -464,11 +472,6 @@ int log_get_level(void)
  */
 void log_message(int level, const char *file, int line, const char *fmt, ...)
 {
-    /* Check log level */
-    if (level > g_log_level) {
-        return;
-    }
-
     /* Determine level string */
     const char *level_str;
     switch (level) {
@@ -487,6 +490,11 @@ void log_message(int level, const char *file, int line, const char *fmt, ...)
 
     /* Format prefix */
     pthread_mutex_lock(&log_mutex);
+    if (g_log_shutdown || level > g_log_level) {
+        pthread_mutex_unlock(&log_mutex);
+        return;
+    }
+
     offset = format_log_prefix(buffer, MAX_LOG_LINE, level_str, file, line);
     if (offset < 0 || offset >= MAX_LOG_LINE) {
         pthread_mutex_unlock(&log_mutex);
@@ -550,17 +558,21 @@ void log_shutdown(void)
 {
     pthread_mutex_lock(&log_mutex);
 
+    if (g_log_shutdown) {
+        pthread_mutex_unlock(&log_mutex);
+        return;
+    }
+
     if (g_log_file != NULL && g_log_file != stderr) {
         fflush(g_log_file);
         fclose(g_log_file);
-        g_log_file = NULL;
     }
 
+    g_log_file = NULL;
     g_log_level = LOG_LEVEL_NONE;
+    g_log_shutdown = 1;
 
     pthread_mutex_unlock(&log_mutex);
-
-    fprintf(stderr, "Legacy logging subsystem shut down.\n");
 }
 
 /**

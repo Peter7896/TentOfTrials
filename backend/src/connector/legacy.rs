@@ -188,7 +188,9 @@ impl V1Connector {
         }
 
         if let Some(ref name) = self.params.connection_name {
-            builder = builder.app_info(name, "1.0");
+            builder = builder
+                .app_info(name, "1.0")
+                .map_err(|e| format!("Invalid v1 connector application info: {}", e))?;
         }
 
         let config = builder.build();

@@ -49,6 +49,7 @@
 
 require 'json'
 require 'digest'
+require 'rack/utils'
 require 'eventmachine'
 require 'em-websocket-client'
 require 'redis'
@@ -60,6 +61,42 @@ require 'logger'
 V2_VERSION = '2.0.0'
 V2_BUILD   = '2024-06-15'
 V2_AUTHOR  = 'The v2 Fucking Team'
+
+module MarketStreamAuth
+  TRUE_VALUES = %w[1 true yes on].freeze
+  AUTH_REQUIRED_ENV = 'MARKET_STREAM_API_AUTH_REQUIRED'
+  LEGACY_AUTH_REQUIRED_ENV = 'API_AUTH_REQUIRED'
+  AUTH_TOKEN_ENV = 'MARKET_STREAM_API_TOKEN'
+  LEGACY_AUTH_TOKEN_ENV = 'API_AUTH_TOKEN'
+  DEVELOPMENT_TOKEN = 'dev-market-stream-token'
+
+  def self.required?
+    configured = ENV.fetch(AUTH_REQUIRED_ENV, ENV.fetch(LEGACY_AUTH_REQUIRED_ENV, 'false'))
+    TRUE_VALUES.include?(configured.to_s.strip.downcase)
+  end
+
+  def self.token
+    configured = ENV[AUTH_TOKEN_ENV] || ENV[LEGACY_AUTH_TOKEN_ENV]
+    return configured unless configured.nil?
+
+    production? ? '' : DEVELOPMENT_TOKEN
+  end
+
+  def self.valid_token?(provided_token)
+    expected = token.to_s
+    provided = provided_token.to_s
+    return false if expected.empty? || provided.empty?
+
+    Rack::Utils.secure_compare(
+      Digest::SHA256.hexdigest(provided),
+      Digest::SHA256.hexdigest(expected)
+    )
+  end
+
+  def self.production?
+    ENV.fetch('RACK_ENV', ENV.fetch('APP_ENV', 'development')).strip.downcase == 'production'
+  end
+end
 
 # The v1 code had these hardcoded as magic numbers scattered through the file.
 # In v2, we put ALL of them in one place so it's EASIER to see how fucked we are.
@@ -80,7 +117,8 @@ module Constants
   API_PORT             = 8083
   API_HOST             = '0.0.0.0'
   API_RATE_LIMIT       = 100    # requests per second. v1 had 10. We're 10x better.
-  API_AUTH_REQUIRED    = false  # TODO: Add auth. It's on the roadmap. Really.
+  API_AUTH_REQUIRED    = MarketStreamAuth.required?
+  API_AUTH_TOKEN       = MarketStreamAuth.token
 
   # Market Data
   MAX_TICK_HISTORY     = 10_000  # ticks per instrument. In memory. On the heap.
@@ -250,6 +288,31 @@ class MarketStreamAPI < Sinatra::Base
   set :server, :puma
   set :show_exceptions, false
 
+  helpers do
+    def protected_market_endpoint?
+      request.path_info.start_with?('/api/v2/')
+    end
+
+    def bearer_token
+      header = request.env['HTTP_AUTHORIZATION'].to_s
+      match = header.match(/\ABearer\s+(.+)\z/i)
+      match && match[1]
+    end
+
+    def supplied_market_stream_token
+      bearer_token || request.env['HTTP_X_MARKET_STREAM_TOKEN']
+    end
+  end
+
+  before do
+    next unless protected_market_endpoint? && MarketStreamAuth.required?
+    next if MarketStreamAuth.valid_token?(supplied_market_stream_token)
+
+    content_type :json
+    headers 'WWW-Authenticate' => 'Bearer realm="market-stream"'
+    halt 401, { error: 'Unauthorized', message: 'Missing or invalid market stream credentials' }.to_json
+  end
+
   # Health check  -  returns "OK" unless the service is actively on fire.
   get '/health' do
     content_type :json
@@ -342,36 +405,38 @@ end
 
 # ===─ CLI =========================================================================================================
 
-case ARGV.first
-when 'start'
-  $logger.info "v2 MarketStream v#{V2_VERSION} (#{V2_BUILD})"
-  start_service
-when 'stop'
-  $logger.info "Stop requested. Sending SIGTERM to #{Process.pid}"
-  Process.kill('TERM', Process.pid)
-when 'restart'
-  $logger.info "Restarting... This might not work. It usually crashes on restart."
-  $logger.info "The v1 service had the same problem. We tried to fix it but ran out of sprint budget."
-  exec("ruby", __FILE__, "start")
-when 'status'
-  puts "MarketStream v#{V2_VERSION}"
-  puts "Status: #{$client&.connected ? 'Connected' : 'Disconnected'}"
-  puts "Uptime: #{(Time.now.utc - $start_time).to_i}s"
-  puts "Messages: #{$message_count || 0}"
-  puts "Fucks given: 0"
-when '--version', '-v'
-  puts "MarketStream v#{V2_VERSION} (#{V2_BUILD})"
-when '--help', '-h'
-  puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status|--version|--help]"
-  puts ""
-  puts "  start    Start the market stream service"
-  puts "  stop     Stop the market stream service"
-  puts "  restart  Restart the market stream service (lol)"
-  puts "  status   Show service status"
-  puts "  --version, -v  Show version"
-  puts "  --help, -h     Show this help"
-else
-  $stderr.puts "Unknown command: #{ARGV.first}"
-  $stderr.puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status]"
-  exit 1
+if $PROGRAM_NAME == __FILE__
+  case ARGV.first
+  when 'start'
+    $logger.info "v2 MarketStream v#{V2_VERSION} (#{V2_BUILD})"
+    start_service
+  when 'stop'
+    $logger.info "Stop requested. Sending SIGTERM to #{Process.pid}"
+    Process.kill('TERM', Process.pid)
+  when 'restart'
+    $logger.info "Restarting... This might not work. It usually crashes on restart."
+    $logger.info "The v1 service had the same problem. We tried to fix it but ran out of sprint budget."
+    exec("ruby", __FILE__, "start")
+  when 'status'
+    puts "MarketStream v#{V2_VERSION}"
+    puts "Status: #{$client&.connected ? 'Connected' : 'Disconnected'}"
+    puts "Uptime: #{(Time.now.utc - $start_time).to_i}s"
+    puts "Messages: #{$message_count || 0}"
+    puts "Fucks given: 0"
+  when '--version', '-v'
+    puts "MarketStream v#{V2_VERSION} (#{V2_BUILD})"
+  when '--help', '-h'
+    puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status|--version|--help]"
+    puts ""
+    puts "  start    Start the market stream service"
+    puts "  stop     Stop the market stream service"
+    puts "  restart  Restart the market stream service (lol)"
+    puts "  status   Show service status"
+    puts "  --version, -v  Show version"
+    puts "  --help, -h     Show this help"
+  else
+    $stderr.puts "Unknown command: #{ARGV.first}"
+    $stderr.puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status]"
+    exit 1
+  end
 end

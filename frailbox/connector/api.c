@@ -174,6 +174,8 @@ typedef struct {
     worker_thread_t workers[MAX_WORKER_THREADS];
     int worker_count;
     operation_queue_t queue;
+    uint32_t active_operations;
+    uint32_t last_wait_unfinished;
     pthread_mutex_t state_mutex;
 
     /* Timing */
@@ -205,6 +207,7 @@ static connector_result_t internal_enqueue(connector_operation_t *op);
 static connector_result_t internal_dequeue(connector_operation_t **op, int timeout_ms);
 static void *internal_worker_thread(void *arg);
 static connector_result_t internal_process_operation(connector_operation_t *op);
+static uint32_t internal_count_unfinished_locked(void);
 static void internal_update_stats(connector_result_t result, uint64_t latency_us);
 static uint64_t internal_now_ms(void);
 static void internal_set_error(int code, const char *fmt, ...);
@@ -362,6 +365,8 @@ connector_result_t connector_set_config(const connector_config_t *config)
 
 connector_result_t connector_get_stats(connector_stats_t *stats)
 {
+    uint32_t queue_depth = 0;
+
     if (stats == NULL) {
         return CONNECTOR_ERROR_INVALID_PARAM;
     }
@@ -369,9 +374,15 @@ connector_result_t connector_get_stats(connector_stats_t *stats)
         return CONNECTOR_ERROR_INVALID_PARAM;
     }
 
+    if (g_ctx.initialized) {
+        pthread_mutex_lock(&g_ctx.queue.mutex);
+        queue_depth = internal_count_unfinished_locked();
+        pthread_mutex_unlock(&g_ctx.queue.mutex);
+    }
+
     *stats = g_ctx.stats;
     stats->state = g_ctx.state;
-    stats->queue_depth = g_ctx.queue.count;
+    stats->queue_depth = queue_depth;
     stats->last_error_code = g_ctx.last_error;
     memcpy(stats->last_error_message, g_ctx.last_error_msg, ERROR_MESSAGE_BUF_SIZE);
 
@@ -475,9 +486,65 @@ connector_result_t connector_cancel(uint64_t operation_id)
 
 connector_result_t connector_wait_all(uint32_t timeout_ms)
 {
-    uint64_t deadline = internal_now_ms() + timeout_ms;
-    (void)deadline;
-    /* TODO: Implement proper wait-all with timeout */
+    uint64_t deadline;
+    uint32_t unfinished;
+
+    if (!g_ctx.initialized) {
+        return CONNECTOR_ERROR_NOT_INIT;
+    }
+
+    deadline = internal_now_ms() + timeout_ms;
+    pthread_mutex_lock(&g_ctx.queue.mutex);
+
+    while ((unfinished = internal_count_unfinished_locked()) > 0) {
+        uint64_t now;
+        uint64_t remaining_ms;
+        struct timespec ts;
+        int ret;
+
+        if (timeout_ms == 0) {
+            g_ctx.last_wait_unfinished = unfinished;
+            pthread_mutex_unlock(&g_ctx.queue.mutex);
+            internal_set_error(CONNECTOR_ERROR_TIMEOUT,
+                "connector_wait_all timed out with %u unfinished operation(s)",
+                unfinished);
+            return CONNECTOR_ERROR_TIMEOUT;
+        }
+
+        now = internal_now_ms();
+        if (now >= deadline) {
+            g_ctx.last_wait_unfinished = unfinished;
+            pthread_mutex_unlock(&g_ctx.queue.mutex);
+            internal_set_error(CONNECTOR_ERROR_TIMEOUT,
+                "connector_wait_all timed out with %u unfinished operation(s)",
+                unfinished);
+            return CONNECTOR_ERROR_TIMEOUT;
+        }
+
+        remaining_ms = deadline - now;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (time_t)(remaining_ms / 1000);
+        ts.tv_nsec += (long)((remaining_ms % 1000) * 1000000);
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+
+        ret = pthread_cond_timedwait(&g_ctx.queue.not_full,
+            &g_ctx.queue.mutex, &ts);
+        if (ret == ETIMEDOUT &&
+            (unfinished = internal_count_unfinished_locked()) > 0) {
+            g_ctx.last_wait_unfinished = unfinished;
+            pthread_mutex_unlock(&g_ctx.queue.mutex);
+            internal_set_error(CONNECTOR_ERROR_TIMEOUT,
+                "connector_wait_all timed out with %u unfinished operation(s)",
+                unfinished);
+            return CONNECTOR_ERROR_TIMEOUT;
+        }
+    }
+
+    g_ctx.last_wait_unfinished = 0;
+    pthread_mutex_unlock(&g_ctx.queue.mutex);
     return CONNECTOR_SUCCESS;
 }
 
@@ -845,6 +912,7 @@ static connector_result_t internal_dequeue(connector_operation_t **op, int timeo
     *op = g_ctx.queue.entries[g_ctx.queue.head].operation;
     g_ctx.queue.head = (g_ctx.queue.head + 1) % MAX_QUEUE_DEPTH;
     g_ctx.queue.count--;
+    g_ctx.active_operations++;
 
     pthread_cond_signal(&g_ctx.queue.not_full);
     pthread_mutex_unlock(&g_ctx.queue.mutex);
@@ -872,7 +940,14 @@ static void *internal_worker_thread(void *arg)
             } else {
                 worker->operations_failed++;
             }
+
+            pthread_mutex_lock(&g_ctx.queue.mutex);
+            if (g_ctx.active_operations > 0) {
+                g_ctx.active_operations--;
+            }
             worker->busy = 0;
+            pthread_cond_broadcast(&g_ctx.queue.not_full);
+            pthread_mutex_unlock(&g_ctx.queue.mutex);
         }
     }
 
@@ -881,13 +956,20 @@ static void *internal_worker_thread(void *arg)
 
 static connector_result_t internal_process_operation(connector_operation_t *op)
 {
-    (void)op;
     /* TODO: Implement actual operation processing.
      * This is a stub that always succeeds for now. The real implementation
      * will involve the actual I/O subsystem which is being rewritten.
      * The stub exists so that the connector API can be tested end-to-end
      * without the I/O subsystem being available. */
+    if (op != NULL && op->callback != NULL) {
+        op->callback(op->operation_id, CONNECTOR_SUCCESS, op->user_data);
+    }
     return CONNECTOR_SUCCESS;
+}
+
+static uint32_t internal_count_unfinished_locked(void)
+{
+    return (uint32_t)g_ctx.queue.count + g_ctx.active_operations;
 }
 
 static void internal_update_stats(connector_result_t result, uint64_t latency_us)

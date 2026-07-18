@@ -506,6 +506,110 @@ class MigrationEngine:
 
         return self.result
 
+    def dry_run_restore_validation(self, config_path: str) -> MigrationResult:
+        """
+        Validate restore readiness without writing to the target database.
+
+        The dry-run restore path checks the backup directory, manifest, listed
+        backup files, target schema compatibility, and expected row/checksum
+        metadata. It intentionally does not call _restore_from_backup() or write
+        migration state, so production data remains untouched.
+        """
+        started_at = datetime.now(timezone.utc)
+        config = load_config_file(config_path)
+        migration_id = str(config.get("migration_id") or self.config.migration_id)
+        result = MigrationResult(
+            migration_id=migration_id,
+            status=MigrationStatus.RUNNING,
+            started_at=started_at,
+        )
+        result.metadata.update({
+            "dry_run_restore": True,
+            "would_modify_target": False,
+            "config_path": str(Path(config_path)),
+        })
+
+        def fail(phase: str, message: str, **metadata: Any) -> MigrationResult:
+            result.status = MigrationStatus.FAILED
+            result.completed_at = datetime.now(timezone.utc)
+            result.duration_seconds = (result.completed_at - started_at).total_seconds()
+            result.errors.append({
+                "phase": phase,
+                "error": message,
+                "timestamp": result.completed_at.isoformat(),
+                **metadata,
+            })
+            result.metadata.update(metadata)
+            return result
+
+        backup_root = Path(str(config.get("backup_dir") or self.config.backup_dir or DEFAULT_CONFIG["backup_dir"]))
+        backup_path = Path(str(config.get("backup_path") or backup_root / f"migration_{migration_id}"))
+        result.metadata["backup_path"] = str(backup_path)
+
+        if not backup_path.exists():
+            return fail("backup_check", f"Backup path does not exist: {backup_path}", backup_path=str(backup_path))
+        if not backup_path.is_dir():
+            return fail("backup_check", f"Backup path is not a directory: {backup_path}", backup_path=str(backup_path))
+
+        manifest_path = backup_path / "manifest.json"
+        result.metadata["manifest_path"] = str(manifest_path)
+        if not manifest_path.exists():
+            return fail("backup_check", f"Backup manifest not found: {manifest_path}", manifest_path=str(manifest_path))
+
+        try:
+            with manifest_path.open(encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            return fail("backup_check", f"Backup manifest could not be read: {e}", manifest_path=str(manifest_path))
+
+        if not isinstance(manifest, dict):
+            return fail("backup_check", "Backup manifest must be a JSON object", manifest_path=str(manifest_path))
+
+        source_schema = manifest.get("from_version") or manifest.get("schema_version")
+        target_schema = config.get("target_schema_version", config.get("target_version"))
+        result.metadata["backup_schema_version"] = source_schema
+        result.metadata["target_schema_version"] = target_schema
+        if target_schema is not None and source_schema is not None and int(target_schema) != int(source_schema):
+            return fail(
+                "schema_check",
+                f"Target schema version {target_schema} is incompatible with backup schema version {source_schema}",
+                expected_schema_version=source_schema,
+                target_schema_version=target_schema,
+            )
+
+        missing_files: List[str] = []
+        for entry in manifest.get("files", []):
+            rel_path = entry.get("path") if isinstance(entry, dict) else entry
+            if not rel_path:
+                continue
+            candidate = backup_path / str(rel_path)
+            if not candidate.exists():
+                missing_files.append(str(rel_path))
+        if missing_files:
+            return fail("backup_check", f"Backup files are missing: {missing_files}", missing_files=missing_files)
+
+        expected_row_count = manifest.get("row_count")
+        expected_row_counts = manifest.get("row_counts", {})
+        expected_checksums = manifest.get("checksums", {})
+        result.metadata.update({
+            "backup_manifest": manifest,
+            "backup_files": manifest.get("files", []),
+            "expected_row_count": expected_row_count,
+            "expected_row_counts": expected_row_counts,
+            "expected_checksums": expected_checksums,
+        })
+        if isinstance(expected_row_count, int):
+            result.total_records = expected_row_count
+        elif isinstance(expected_row_counts, dict):
+            result.total_records = sum(v for v in expected_row_counts.values() if isinstance(v, int))
+        if isinstance(expected_checksums, dict):
+            result.checksums.update({str(k): str(v) for k, v in expected_checksums.items()})
+
+        result.status = MigrationStatus.COMPLETED
+        result.completed_at = datetime.now(timezone.utc)
+        result.duration_seconds = (result.completed_at - started_at).total_seconds()
+        return result
+
     def _finalize(self, status: MigrationStatus) -> MigrationResult:
         """Finalize the migration result with the given status."""
         now = datetime.now(timezone.utc)
@@ -983,6 +1087,71 @@ def write_json_file(path: str, data: Any, pretty: bool = True) -> None:
         raise
 
 
+def migration_result_to_dict(result: MigrationResult) -> Dict[str, Any]:
+    """Convert MigrationResult to stable JSON-friendly output."""
+    data = asdict(result)
+    data["status"] = result.status.value
+    data["started_at"] = result.started_at.isoformat()
+    data["completed_at"] = result.completed_at.isoformat() if result.completed_at else None
+    return data
+
+
+def parse_scalar_config_value(value: str) -> Any:
+    """Parse a small YAML-like scalar value without taking a PyYAML dependency."""
+    value = value.strip()
+    if value == "":
+        return ""
+    if value[0:1] in {"'", '"'} and value[-1:] == value[0]:
+        return value[1:-1]
+    lowered = value.lower()
+    if lowered in {"true", "yes", "on"}:
+        return True
+    if lowered in {"false", "no", "off"}:
+        return False
+    if lowered in {"null", "none", "~"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def load_config_file(path: str) -> Dict[str, Any]:
+    """Load JSON or simple top-level key/value YAML migration config."""
+    config_path = Path(path)
+    text = config_path.read_text(encoding="utf-8")
+    if not text.strip():
+        return {}
+
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
+        loaded = None
+
+    if isinstance(loaded, dict):
+        return loaded
+    if loaded is not None:
+        raise ValueError("migration config must be a JSON object")
+
+    config: Dict[str, Any] = {}
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            raise ValueError(f"unsupported config line {line_no}: expected key: value")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"unsupported config line {line_no}: empty key")
+        config[key] = parse_scalar_config_value(value)
+    return config
+
+
 def batch_iterator(items: List[Any], batch_size: int):
     """Iterate over items in batches."""
     for i in range(0, len(items), batch_size):
@@ -1148,9 +1317,32 @@ def main():
             print("  No migration state found")
 
     elif args.command == "dry-run":
-        print(f"Dry run with config: {args.config}")
-        # TODO: Implement dry run logic
-        print("Dry run complete (no changes made)")
+        config_data = load_config_file(args.config)
+        config = MigrationConfig(
+            migration_id=str(config_data.get("migration_id") or f"DRY-{datetime.now().strftime('%Y%m%d%H%M%S')}"),
+            migration_type=MigrationType.DATA,
+            from_version=int(config_data.get("from_version", 1)),
+            to_version=int(config_data.get("to_version", 2)),
+            source_connection=str(config_data.get("source_connection", "dry-run")),
+            target_connection=str(config_data.get("target_connection", "dry-run")),
+            backup_dir=str(config_data.get("backup_dir", DEFAULT_CONFIG["backup_dir"])),
+            dry_run=True,
+            create_backup=False,
+        )
+        engine = MigrationEngine(config)
+        result = engine.dry_run_restore_validation(args.config)
+        if args.report:
+            print(json.dumps(migration_result_to_dict(result), indent=2, default=str))
+        else:
+            print(f"Dry-run restore validation: {result.status.value}")
+            print(f"  Backup path: {result.metadata.get('backup_path', 'unknown')}")
+            print(f"  Expected rows: {result.metadata.get('expected_row_count', result.total_records)}")
+            print(f"  Checksum entries: {len(result.checksums)}")
+            if result.errors:
+                print("  Errors:")
+                for error in result.errors:
+                    print(f"    - {error['phase']}: {error['error']}")
+        return 0 if result.status == MigrationStatus.COMPLETED else 1
 
     elif args.command == "list":
         print("Listing completed migrations...")

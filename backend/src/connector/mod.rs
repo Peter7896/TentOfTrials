@@ -41,7 +41,7 @@ pub mod types;
 // Re-export commonly used types
 pub use bridge::ConnectorBridge;
 pub use types::{
-    ConnectorConfig, ConnectorConfigBuilder,
+    ConnectorConfig, ConnectorConfigBuilder, ConnectorConfigError,
     ConnectorResult, ConnectorMode, ConnectorState,
     ConnectorStats, ConnectorBuffer, FeatureFlag,
 };

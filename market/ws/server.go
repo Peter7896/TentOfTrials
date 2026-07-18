@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,19 +17,89 @@ import (
 	"go.uber.org/zap"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+const allowedOriginsEnv = "MARKET_WS_ALLOWED_ORIGINS"
+
+type OriginConfig struct {
+	AllowedOrigins []string
+	AllowLocalhost bool
+	AllowMissing   bool
+}
+
+func DefaultOriginConfig() OriginConfig {
+	return OriginConfig{
+		AllowedOrigins: splitOriginList(os.Getenv(allowedOriginsEnv)),
+		AllowLocalhost: true,
+		AllowMissing:   true,
+	}
+}
+
+func splitOriginList(value string) []string {
+	if value == "" {
+		return nil
+	}
+
+	origins := strings.Split(value, ",")
+	result := make([]string, 0, len(origins))
+	seen := make(map[string]struct{}, len(origins))
+	for _, origin := range origins {
+		origin = strings.TrimSpace(origin)
+		if origin == "" {
+			continue
+		}
+		origin = strings.TrimRight(origin, "/")
+		if _, ok := seen[origin]; ok {
+			continue
+		}
+		seen[origin] = struct{}{}
+		result = append(result, origin)
+	}
+
+	return result
+}
+
+func (c OriginConfig) CheckOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return c.AllowMissing
+	}
+
+	origin = strings.TrimRight(origin, "/")
+	for _, allowed := range c.AllowedOrigins {
+		if origin == allowed {
+			return true
+		}
+	}
+
+	return c.AllowLocalhost && isLocalhostOrigin(origin)
+}
+
+func isLocalhostOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+
+	switch parsed.Scheme {
+	case "http", "https", "ws", "wss":
+	default:
+		return false
+	}
+
+	switch strings.ToLower(parsed.Hostname()) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	subs     map[types.Symbol]struct{}
-	remote   string
-	mu       sync.Mutex
+	hub    *Hub
+	conn   *websocket.Conn
+	send   chan []byte
+	subs   map[types.Symbol]struct{}
+	remote string
+	mu     sync.Mutex
 }
 
 type Hub struct {
@@ -39,11 +112,12 @@ type Hub struct {
 }
 
 type Server struct {
-	hub    *Hub
-	engine *matching.MatchingEngine
-	logger *zap.Logger
-	port   int
-	srv    *http.Server
+	hub      *Hub
+	engine   *matching.MatchingEngine
+	logger   *zap.Logger
+	port     int
+	srv      *http.Server
+	upgrader websocket.Upgrader
 }
 
 func NewHub(logger *zap.Logger) *Hub {
@@ -96,11 +170,20 @@ func (h *Hub) Run() {
 }
 
 func NewServer(hub *Hub, engine *matching.MatchingEngine, logger *zap.Logger, port int) *Server {
+	return NewServerWithOriginConfig(hub, engine, logger, port, DefaultOriginConfig())
+}
+
+func NewServerWithOriginConfig(hub *Hub, engine *matching.MatchingEngine, logger *zap.Logger, port int, originConfig OriginConfig) *Server {
 	return &Server{
 		hub:    hub,
 		engine: engine,
 		logger: logger,
 		port:   port,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  4096,
+			WriteBufferSize: 4096,
+			CheckOrigin:     originConfig.CheckOrigin,
+		},
 	}
 }
 
@@ -129,7 +212,7 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Error("websocket upgrade failed", zap.Error(err))
 		return
