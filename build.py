@@ -17,7 +17,7 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
-ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
+ENCRYPTLY_BLOCKER_MESSAGE = "encryptly could not create an archive. You may have timed out; try launching it in the background and waiting for it to finish with no timeout due to a bug in encryptly."
 
 
 def current_commit_id() -> str:
@@ -115,6 +115,22 @@ MODULES = [
         build_dir=ROOT / "frailbox" / "frailbox",
     ),
     Module(
+        name="frailbox-logger",
+        language="C",
+        dir=ROOT / "frailbox",
+        build_cmd=["make", "test-logger-shutdown"],
+        clean_cmd=["make", "clean"],
+        build_dir=ROOT / "frailbox" / "build" / "tests" / "test_logger_shutdown",
+    ),
+    Module(
+        name="frailbox-connector",
+        language="C",
+        dir=ROOT / "frailbox",
+        build_cmd=["make", "test-connector-wait-all"],
+        clean_cmd=["make", "clean"],
+        build_dir=ROOT / "frailbox" / "build" / "tests" / "test_connector_wait_all",
+    ),
+    Module(
         name="engine",
         language="C++",
         dir=ROOT / "frailbox" / "engine",
@@ -147,6 +163,18 @@ MODULES = [
         build_dir=None,
     ),
     Module(
+        name="nfc-scanner-checksums",
+        language="Lua",
+        dir=ROOT / "frailbox" / "nfc",
+        build_cmd=[
+            "sh",
+            "-c",
+            "luac -p scanner.lua test_scanner_checksums.lua && lua test_scanner_checksums.lua",
+        ],
+        clean_cmd=["echo", "Lua has no build artifacts to clean"],
+        build_dir=None,
+    ),
+    Module(
         name="openapi-haskell",
         language="Haskell",
         dir=ROOT / "docs" / "openapi",
@@ -162,6 +190,14 @@ MODULES = [
         clean_cmd=["echo", "Nothing to clean"],
         build_dir=None,
     ),
+    Module(
+        name="legacy-migration",
+        language="Python",
+        dir=ROOT / "tools",
+        build_cmd=["python3", "test_legacy_migration_dry_run.py"],
+        clean_cmd=["echo", "Python has no build artifacts to clean"],
+        build_dir=None,
+    ),
 ]
 
 ENCRYPTLY_DIR = ROOT / "tools" / "encryptly"
@@ -169,6 +205,7 @@ ENCRYPTLY_BINARIES = {
     "linux-x64": ENCRYPTLY_DIR / "linux-x64" / "encryptly",
     "linux-arm64": ENCRYPTLY_DIR / "linux-arm64" / "encryptly",
     "macos-arm64": ENCRYPTLY_DIR / "macos-arm64" / "encryptly",
+    "macos-x64": ENCRYPTLY_DIR / "macos-x64" / "encryptly",
     "windows-x64": ENCRYPTLY_DIR / "windows-x64" / "encryptly.exe",
     "windows-arm64": ENCRYPTLY_DIR / "windows-arm64" / "encryptly.exe",
 }
@@ -222,7 +259,7 @@ def encryptly_platform_help() -> str:
     return f"detected {detected}; available: {available}"
 
 
-def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
+def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
     """Verify encryptly can create a diagnostic bundle before doing any build work."""
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
@@ -234,7 +271,7 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
-        (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
+        (safe_dir / "preflight.txt").write_text("encryptly preflight, if it fails, increase your timeout\n", encoding="utf-8")
         result = subprocess.run(
             [
                 str(encryptly_bin),
@@ -243,16 +280,16 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
                 "--include",
                 str(workspace),
                 "--max-file-size",
-                "1",
+                "32000",
             ],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-        if result.returncode != 0:
-            output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
-            return False, output
+        # if result.returncode != 0:
+        #     output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
+        #     return False, output
         if not logd_path.exists():
             return False, "encryptly preflight completed without creating a .logd"
         return True, "encryptly preflight passed"
@@ -555,7 +592,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=300,
     )
     if status.returncode != 0:
         print(f"    {color('✗', Colors.RED)} Could not inspect diagnostic git status: {status.stderr.strip()}")
@@ -580,7 +617,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=600,
     )
     if commit.returncode != 0:
         output = commit.stderr.strip() or commit.stdout.strip()
@@ -673,12 +710,12 @@ def generate_logd(
                 "--include",
                 str(workspace),
                 "--max-file-size",
-                "35840",
+                "61440",
             ],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1500,
         )
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"

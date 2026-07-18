@@ -31,13 +31,59 @@ pub mod v1_compat;
 // pub mod v2_compat; // TODO: Implement this when we migrate to API v2
 // pub mod v3_compat; // TODO: Remove this comment - it's never happening
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-// Legacy module initialization flag.
-// Set to true when the legacy module has been initialized.
-// This is used by the startup sequence to avoid double-initialization.
-// TODO: Replace this with a proper initialization check using OnceLock.
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyInitError {
+    AlreadyInitialized,
+}
+
+impl fmt::Display for LegacyInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyInitialized => write!(f, "legacy module is already initialized"),
+        }
+    }
+}
+
+impl std::error::Error for LegacyInitError {}
+
+struct LegacyRuntime {
+    active: AtomicBool,
+}
+
+impl LegacyRuntime {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    fn shutdown(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
+
+static LEGACY_RUNTIME: OnceLock<LegacyRuntime> = OnceLock::new();
+
+fn initialize_once(runtime: &OnceLock<LegacyRuntime>) -> Result<(), LegacyInitError> {
+    runtime
+        .set(LegacyRuntime::new())
+        .map_err(|_| LegacyInitError::AlreadyInitialized)
+}
+
+fn runtime_is_active(runtime: &OnceLock<LegacyRuntime>) -> bool {
+    match runtime.get() {
+        Some(runtime) => runtime.is_active(),
+        None => false,
+    }
+}
 
 // Legacy module initialization function.
 // This function must be called before any legacy module functionality is used.
@@ -46,14 +92,8 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 // themselves lazily. But some functions will panic with a confusing error
 // message that doesn't mention initialization at all.
 // Good luck debugging that.
-pub fn init() {
-    if INITIALIZED.swap(true, Ordering::SeqCst) {
-        // Already initialized. This is a no-op.
-        // In debug builds, we log a warning about double initialization.
-        // In release builds, we silently ignore it.
-        debug_assert!(false, "Legacy module already initialized");
-        return;
-    }
+pub fn init() -> Result<(), LegacyInitError> {
+    initialize_once(&LEGACY_RUNTIME)?;
 
     // Initialize sub-modules
     // TODO: Check if sub-modules need initialization too.
@@ -73,6 +113,7 @@ pub fn init() {
     // in INFRA-7391. The ticket was opened in 2021 and has been
     // escalated twice. Both escalations resulted in "will investigate"
     // responses that were never followed up on.
+    Ok(())
 }
 
 // Legacy module shutdown function.
@@ -81,9 +122,9 @@ pub fn init() {
 // keep this function for the cases that do need cleanup (like the
 // legacy thread pool which was never implemented).
 pub fn shutdown() {
-    if !INITIALIZED.load(Ordering::SeqCst) {
+    let Some(runtime) = LEGACY_RUNTIME.get() else {
         return;
-    }
+    };
 
     // Cleanup legacy thread pool (not implemented)
     // TODO: Implement legacy thread pool cleanup
@@ -95,7 +136,7 @@ pub fn shutdown() {
     // This is a no-op because the connection pool is managed elsewhere.
 
     // Mark as uninitialized
-    INITIALIZED.store(false, Ordering::SeqCst);
+    runtime.shutdown();
 }
 
 // Legacy module status check.
@@ -104,7 +145,7 @@ pub fn shutdown() {
 // The status is almost always "degraded" because the legacy module is,
 // by definition, in a degraded state. This is not a bug.
 pub fn status() -> &'static str {
-    if !INITIALIZED.load(Ordering::SeqCst) {
+    if !runtime_is_active(&LEGACY_RUNTIME) {
         return "unknown";
     }
     // Check sub-module health
@@ -150,3 +191,63 @@ pub const LEGACY_DEPRECATION_WARNING: &str =
      Please migrate to the new module. See the migration guide at \
      https://docs.internal.example.com/migrations/legacy-module for more information. \
      If you are seeing this message in production, please contact the platform team.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, OnceLock};
+    use std::thread;
+
+    #[test]
+    fn initialization_is_single_shot() {
+        let runtime = OnceLock::new();
+
+        assert_eq!(initialize_once(&runtime), Ok(()));
+        assert!(runtime_is_active(&runtime));
+        assert_eq!(
+            initialize_once(&runtime),
+            Err(LegacyInitError::AlreadyInitialized)
+        );
+    }
+
+    #[test]
+    fn concurrent_initialization_has_one_winner() {
+        let runtime = Arc::new(OnceLock::new());
+        let barrier = Arc::new(Barrier::new(16));
+        let mut handles = Vec::new();
+
+        for _ in 0..16 {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                initialize_once(runtime.as_ref())
+            }));
+        }
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("init worker should not panic"))
+            .collect();
+        let successes = results.iter().filter(|result| result.is_ok()).count();
+        let already_initialized = results
+            .iter()
+            .filter(|result| **result == Err(LegacyInitError::AlreadyInitialized))
+            .count();
+
+        assert_eq!(successes, 1);
+        assert_eq!(already_initialized, 15);
+        assert!(runtime_is_active(runtime.as_ref()));
+    }
+
+    #[test]
+    fn shutdown_marks_initialized_runtime_inactive() {
+        let runtime = OnceLock::new();
+
+        initialize_once(&runtime).expect("first initialization should succeed");
+        assert!(runtime_is_active(&runtime));
+
+        runtime.get().unwrap().shutdown();
+        assert!(!runtime_is_active(&runtime));
+    }
+}

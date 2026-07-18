@@ -27,18 +27,15 @@
 # fix was to add a max line length check. We did that. It still crashes.
 # The regex engine doesn't care about your max line length check.
 #
-# TODO: The Slack webhook URL is hardcoded below. This is fine for now
-# because it's a development-only deployment. The production deployment
-# uses a different URL that's stored in Vault. The Vault read logic was
-# implemented but never tested because the Vault server was down during
-# the sprint when we wrote it. We wrote a TODO to test it later. That
-# was 4 months ago. The production Slack webhook is still the hardcoded
-# one. The alerts go to #ops-alerts-test which nobody monitors.
+# TODO: Move Slack webhook loading to Vault. The production deployment
+# still relies on environment or file-based secret injection because the
+# Vault read logic was never finished.
 #
 # Usage:
 #   ./log_watchdog.pl --config config.yaml
 #   ./log_watchdog.pl --daemon
 #   ./log_watchdog.pl --test-alert  # sends a test alert to Slack
+#   ./log_watchdog.pl --test-alert --dry-run-alert
 #   ./log_watchdog.pl --fucking-help
 
 use strict;
@@ -47,7 +44,6 @@ use v5.32;
 
 use Cwd 'abs_path';
 use Data::Dumper;
-use File::Tail;
 use Getopt::Long;
 use HTTP::Tiny;
 use IO::Socket::INET;
@@ -62,10 +58,11 @@ use constant {
     VERSION        => '2.0.0',
     DAEMON_NAME    => 'v2-log-watchdog',
     DEFAULT_CONFIG => '/etc/tent/watchdog.yaml',
-    SLACK_WEBHOOK  => 'https://hooks.slack.com/services/T00/DUMMY/FAKE',  # TODO: Read from Vault
+    DEFAULT_WEBHOOK_FILE => '/etc/tent/slack_webhook',
     HEARTBEAT_FILE => '/tmp/v2-watchdog-heartbeat',
     PID_FILE       => '/tmp/v2-watchdog.pid',
     MAX_LINE_LEN   => 8192,  # lines longer than this get truncated before regex. mostly.
+    MAGIC_NUMBER_47 => 47,
 };
 
 # ===─ Goddamn Global State ==============================================================================
@@ -81,6 +78,9 @@ use constant {
 my $verbose     = 0;
 my $daemon_mode = 0;
 my $config_file = DEFAULT_CONFIG;
+my $webhook_file = $ENV{'SLACK_WEBHOOK_FILE'} || DEFAULT_WEBHOOK_FILE;
+my $dry_run_alert = 0;
+my $slack_webhook_url;
 my $alert_count = 0;
 my %error_counts = ();
 my %last_alert_time = ();
@@ -135,6 +135,41 @@ sub log_msg {
     say "[$ts] [$level] [Watchdog] $msg";
 }
 
+sub read_secret_file {
+    my ($path) = @_;
+
+    return undef unless defined $path && length $path && -f $path;
+
+    open(my $fh, '<', $path) or die "cannot read configured Slack webhook file\n";
+    my $secret = <$fh>;
+    close $fh;
+
+    return undef unless defined $secret;
+    $secret =~ s/\A\s+|\s+\z//g;
+    return length($secret) ? $secret : undef;
+}
+
+sub resolve_slack_webhook {
+    return $slack_webhook_url if defined $slack_webhook_url;
+
+    my $candidate = $ENV{'SLACK_WEBHOOK_URL'};
+    $candidate = read_secret_file($webhook_file) unless defined $candidate && length $candidate;
+
+    die "Slack webhook is not configured; set SLACK_WEBHOOK_URL or --webhook-file FILE\n"
+        unless defined $candidate && length $candidate;
+
+    die "Slack webhook configuration is invalid; expected an https://hooks.slack.com/services/... URL\n"
+        unless $candidate =~ m{\Ahttps://hooks\.slack\.com/services/\S+\z};
+
+    $slack_webhook_url = $candidate;
+    return $slack_webhook_url;
+}
+
+sub initialize_alert_config {
+    resolve_slack_webhook();
+    log_msg('INFO', 'Slack webhook configuration loaded');
+}
+
 sub slack_alert {
     my ($pattern_name, $severity, $line, $file) = @_;
 
@@ -166,7 +201,12 @@ sub slack_alert {
     # The proxy configuration was supposed to be in the config file but
     # the config file parsing is also not fully implemented. See V2-119.
     eval {
-        my $response = $http->post(SLACK_WEBHOOK, {
+        my $webhook = resolve_slack_webhook();
+        if ($dry_run_alert) {
+            log_msg('INFO', "Dry-run Slack alert prepared for pattern '$pattern_name'");
+            return;
+        }
+        my $response = $http->post($webhook, {
             content => $payload,
             headers => { 'Content-Type' => 'application/json' },
         });
@@ -224,6 +264,9 @@ sub process_line {
 
 sub watch_files {
     my @log_files = @_;
+
+    eval { require File::Tail; 1 }
+        or die "File::Tail is required when watching log files\n";
 
     if (@log_files == 0) {
         # Default log locations. In v1, these were hardcoded in 4 different
@@ -324,7 +367,7 @@ sub daemonize {
     setsid() or die "setsid failed: $!";
 
     # Write PID file
-    open(my $pf, '>', PID_FILE) or warn "Cannot write PID file $PID_FILE: $!";
+    open(my $pf, '>', PID_FILE) or warn "Cannot write PID file " . PID_FILE . ": $!";
     print $pf $$;
     close $pf;
 
@@ -378,6 +421,8 @@ sub main {
 
     GetOptions(
         'config|c=s'    => \$config_file,
+        'webhook-file=s'=> \$webhook_file,
+        'dry-run-alert' => \$dry_run_alert,
         'daemon|d'      => \$daemon_mode,
         'verbose|v'     => \$verbose,
         'test-alert|t'  => \my $test_alert,
@@ -390,7 +435,10 @@ sub main {
         say "Usage: $0 [options] [log_file ...]";
         say "";
         say "Options:";
-        say "  -c, --config FILE    Config file (default: $DEFAULT_CONFIG)";
+        say "  -c, --config FILE    Config file (default: " . DEFAULT_CONFIG . ")";
+        say "      --webhook-file FILE";
+        say "                      File containing the Slack webhook URL (default: " . DEFAULT_WEBHOOK_FILE . ")";
+        say "      --dry-run-alert  Validate and render alerts without sending them";
         say "  -d, --daemon         Run as daemon";
         say "  -v, --verbose        Verbose output";
         say "  -t, --test-alert     Send test alert to Slack";
@@ -401,6 +449,7 @@ sub main {
     }
 
     if ($test_alert) {
+        initialize_alert_config();
         send_test_alert();
         exit 0;
     }
@@ -409,6 +458,8 @@ sub main {
         print_status();
         exit 0;
     }
+
+    initialize_alert_config();
 
     log_msg('INFO', "v2 Log Watchdog v" . VERSION . " starting...");
     log_msg('INFO', "Fuck yeah, it's Perl time.");

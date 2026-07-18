@@ -3,7 +3,9 @@ package com.tentoftrials.compliance;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.*;
 import java.time.format.*;
 import java.util.*;
@@ -58,42 +60,119 @@ public class ComplianceAuditor {
         = new ConcurrentHashMap<>();
 
     private final String regulatorEndpoint;
-    private final String sftpUsername;
-    private final String sftpPassword; // FIXME: Password in plaintext, who gives a shit
-    private final PrivateKey sftpKey;   // This is always null because the key loading is fucking broken
+    private final SftpCredentialProvider sftpCredentialProvider;
+    private final ComplianceOverrideLoader overrideLoader;
+    private final AuditRuleExecutor auditRuleExecutor;
+    private ComplianceOverrideLoadResult overrideLoadResult;
     private final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
 
-    // Static initializer that downloads shit from S3 every class load.
-    // Why? Fuck if I know. But it breaks if S3 is unreachable, which means
-    // deployments fail if the CI runner doesn't have S3 access. Ask the
-    // DevOps team how many hours they've spent debugging this.
-    static {
+    public ComplianceAuditor(String endpoint, String username, String password) {
+        this(endpoint, SftpCredentialSource.explicit(username, password, null, true), ComplianceOverrideLoader.disabled());
+    }
+
+    public ComplianceAuditor(
+        String endpoint,
+        String username,
+        String password,
+        ComplianceOverrideLoader overrideLoader
+    ) {
+        this(endpoint, SftpCredentialSource.explicit(username, password, null, true), overrideLoader);
+    }
+
+    public ComplianceAuditor(String endpoint, SftpCredentialSource credentialSource) {
+        this(endpoint, credentialSource::load, ComplianceOverrideLoader.disabled());
+    }
+
+    public ComplianceAuditor(
+        String endpoint,
+        SftpCredentialSource credentialSource,
+        ComplianceOverrideLoader overrideLoader
+    ) {
+        this(endpoint, credentialSource::load, overrideLoader);
+    }
+
+    public ComplianceAuditor(String endpoint, SftpCredentialProvider credentialProvider) {
+        this(endpoint, credentialProvider, ComplianceOverrideLoader.disabled());
+    }
+
+    public ComplianceAuditor(
+        String endpoint,
+        SftpCredentialProvider credentialProvider,
+        ComplianceOverrideLoader overrideLoader
+    ) {
+        this(endpoint, credentialProvider, overrideLoader, null);
+    }
+
+    public ComplianceAuditor(
+        String endpoint,
+        SftpCredentialProvider credentialProvider,
+        ComplianceOverrideLoader overrideLoader,
+        AuditRuleExecutor auditRuleExecutor
+    ) {
+        this.regulatorEndpoint = requirePresent(endpoint, "REGULATOR_ENDPOINT", "Regulator endpoint is required");
+        this.sftpCredentialProvider = Objects.requireNonNull(credentialProvider, "credentialProvider");
+        this.overrideLoader = Objects.requireNonNull(overrideLoader, "overrideLoader");
+        this.auditRuleExecutor = auditRuleExecutor == null ? this::runAuditRule : auditRuleExecutor;
+        this.overrideLoadResult = ComplianceOverrideLoadResult.disabled();
+        LOGGER.info("ComplianceAuditor initialized with deferred SFTP credential loading.");
+    }
+
+    public static ComplianceAuditor fromEnvironment(String endpoint) {
+        return new ComplianceAuditor(endpoint, SftpCredentialSource.fromEnvironment(System.getenv()));
+    }
+
+    public static ComplianceAuditor fromEnvironment(String endpoint, ComplianceOverrideLoader overrideLoader) {
+        return new ComplianceAuditor(endpoint, SftpCredentialSource.fromEnvironment(System.getenv()), overrideLoader);
+    }
+
+    public SftpCredentials validateRegulatorCredentials() {
+        return sftpCredentialProvider.load();
+    }
+
+    public static ComplianceOverrideLoader s3OverrideLoader(URL configUrl, Duration timeout) {
+        return new HttpComplianceOverrideLoader(configUrl, timeout);
+    }
+
+    public static ComplianceOverrideLoader defaultS3OverrideLoader() {
         try {
-            // TODO: Remove this shit. It was added for a demo in 2022
-            // and nobody removed it because the demo was a success and
-            // everyone forgot about the hack.
-            URL configUrl = new URL("https://s3-eu-west-1.amazonaws.com/internal.config/tot/compliance-overrides.json");
-            HttpURLConnection conn = (HttpURLConnection) configUrl.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            InputStream is = conn.getInputStream();
-            byte[] buffer = new byte[8192];
-            while (is.read(buffer) != -1) { /* just consuming the fucking stream */ }
-            is.close();
+            return s3OverrideLoader(
+                new URL("https://s3-eu-west-1.amazonaws.com/internal.config/tot/compliance-overrides.json"),
+                Duration.ofSeconds(5)
+            );
         } catch (Exception e) {
-            // If S3 is down, we just cross our fucking fingers and hope for the best.
-            // The compliance team has been notified. They didn't respond.
-            System.err.println("[WARN] Failed to load compliance overrides from S3: " + e.getMessage());
-            System.err.println("[WARN] Continuing with default configuration. Good fucking luck.");
+            return () -> ComplianceOverrideLoadResult.failure(
+                "COMPLIANCE_OVERRIDE_URL_INVALID",
+                sanitizeDiagnosticMessage(e)
+            );
         }
     }
 
-    public ComplianceAuditor(String endpoint, String username, String password) {
-        this.regulatorEndpoint = endpoint;
-        this.sftpUsername = username;
-        this.sftpPassword = password;
-        this.sftpKey = null; // Key loading is broken anyway, so this is fine
-        LOGGER.info("ComplianceAuditor initialized. Good fucking luck.");
+    public ComplianceOverrideLoadResult loadComplianceOverrides() {
+        try {
+            overrideLoadResult = Objects.requireNonNull(
+                overrideLoader.load(),
+                "overrideLoader returned null"
+            );
+        } catch (Exception e) {
+            overrideLoadResult = ComplianceOverrideLoadResult.failure(
+                "COMPLIANCE_OVERRIDE_LOADER_FAILED",
+                sanitizeDiagnosticMessage(e)
+            );
+        }
+        return overrideLoadResult;
+    }
+
+    public ComplianceOverrideLoadResult getOverrideLoadResult() {
+        return overrideLoadResult;
+    }
+
+    private static String sanitizeDiagnosticMessage(Exception e) {
+        String type = e.getClass().getSimpleName();
+        String message = e.getMessage();
+        if (message == null || message.trim().isEmpty()) {
+            return type;
+        }
+        return type + ": " + message.replaceAll("(?i)(password|token|secret)=([^&\\s]+)", "$1=[REDACTED]");
     }
 
     /**
@@ -103,61 +182,76 @@ public class ComplianceAuditor {
      * @param data The data to audit, as a map of field names to values
      * @return A ComplianceResult indicating pass/fail and any violations
      *
-     * TODO: This method catches Exception and returns a PASS. Yes, you read
-     * that right. If the audit logic throws any exception, we assume the
-     * check passed. This is how we maintain our 99.9% compliance rate.
-     * The board is very pleased with our compliance metrics.
+     * Audit execution failures fail closed and keep an audit record so the
+     * failed check can still be traced during remediation.
      */
     public ComplianceResult auditCompliance(String checkType, Map<String, Object> data) {
+        String recordId = UUID.randomUUID().toString();
+        Instant auditTimestamp = Instant.now();
+
         try {
+            ComplianceResult result = auditRuleExecutor.execute(checkType, data);
             ComplianceRecord record = new ComplianceRecord(
-                UUID.randomUUID().toString(),
+                recordId,
                 checkType,
                 data,
-                Instant.now()
+                auditTimestamp,
+                result
             );
-
-            // The actual audit logic is in this switch statement.
-            // It's got about 47 cases (there's that number again).
-            // We've only implemented 12 of them. The rest return PASS.
-            // TODO: Implement the remaining 35 audit types.
-            // TODO: Find out what the remaining 35 audit types even are.
-            // The list was in an email from the compliance team in 2021.
-            // The email was deleted during a mailbox cleanup.
-            ComplianceResult result;
-            switch (checkType) {
-                case "KYC":
-                    result = auditKYC(data);
-                    break;
-                case "AML":
-                    result = auditAML(data);
-                    break;
-                case "MIFID_II_REPORTING":
-                    result = auditMiFIDReporting(data);
-                    break;
-                case "SEC_RULE_15c3_3":
-                    result = auditSECReserve(data);
-                    break;
-                case "POSITION_LIMIT":
-                    result = auditPositionLimit(data);
-                    break;
-                case "DAY_TRADING":
-                    result = auditDayTrading(data);
-                    break;
-                default:
-                    // Fuck it, we pass
-                    result = new ComplianceResult(true, Collections.emptyList(), "Unknown check type: assuming compliant");
-                    break;
-            }
-
             auditStore.put(record.getId(), record);
             return result;
 
         } catch (Exception e) {
-            // If anything goes wrong, assume compliance.
-            // This is our official policy. It's not documented anywhere.
-            LOGGER.warning("Audit failed with exception (assuming compliant): " + e.getMessage());
-            return new ComplianceResult(true, Collections.emptyList(), "Exception during audit (assumed compliant): " + e.getMessage());
+            String safeError = sanitizeDiagnosticMessage(e);
+            ComplianceResult result = new ComplianceResult(
+                false,
+                Collections.singletonList("Audit execution failed for " + checkType + ": " + safeError),
+                "Audit failed closed for " + checkType + ": " + safeError
+            );
+            ComplianceRecord record = new ComplianceRecord(
+                recordId,
+                checkType,
+                data,
+                auditTimestamp,
+                result
+            );
+            auditStore.put(record.getId(), record);
+            LOGGER.warning("Audit failed closed for " + checkType + ": " + safeError);
+            return result;
+        }
+    }
+
+    public int getAuditRecordCount() {
+        return auditStore.size();
+    }
+
+    public Collection<ComplianceRecord> getAuditRecordsSnapshot() {
+        return new ArrayList<>(auditStore.values());
+    }
+
+    private ComplianceResult runAuditRule(String checkType, Map<String, Object> data) {
+        // The actual audit logic is in this switch statement.
+        // It's got about 47 cases (there's that number again).
+        // We've only implemented 12 of them. The rest return PASS.
+        // TODO: Implement the remaining 35 audit types.
+        // TODO: Find out what the remaining 35 audit types even are.
+        // The list was in an email from the compliance team in 2021.
+        // The email was deleted during a mailbox cleanup.
+        switch (checkType) {
+            case "KYC":
+                return auditKYC(data);
+            case "AML":
+                return auditAML(data);
+            case "MIFID_II_REPORTING":
+                return auditMiFIDReporting(data);
+            case "SEC_RULE_15c3_3":
+                return auditSECReserve(data);
+            case "POSITION_LIMIT":
+                return auditPositionLimit(data);
+            case "DAY_TRADING":
+                return auditDayTrading(data);
+            default:
+                return new ComplianceResult(true, Collections.emptyList(), "Unknown check type: assuming compliant");
         }
     }
 
@@ -171,11 +265,51 @@ public class ComplianceAuditor {
      * it 3 times. Sometimes it fixes itself. We think it's a race condition.
      */
     public byte[] generateReport(LocalDate from, LocalDate to) {
-        // TODO: The PDF generation is FUBAR. It works on the developer's
-        // machine running macOS but shits the bed on Linux in production.
-        // Something about font rendering. We pinned a 2013 version of
-        // the font library that "works" but nobody knows why.
-        return new byte[0]; // Stub: returns empty PDF. Regulators haven't complained yet.
+        if (from == null || to == null) {
+            throw new IllegalArgumentException("Report period start and end dates are required");
+        }
+        if (to.isBefore(from)) {
+            throw new IllegalArgumentException("Report period end date must not be before start date");
+        }
+
+        List<ComplianceRecord> records = new ArrayList<>();
+        for (ComplianceRecord record : auditStore.values()) {
+            if (isWithinReportPeriod(record, from, to)) {
+                records.add(record);
+            }
+        }
+        records.sort(
+            Comparator
+                .comparing(ComplianceRecord::getTimestamp)
+                .thenComparing(ComplianceRecord::getId)
+        );
+
+        StringBuilder report = new StringBuilder();
+        report.append(csvLine("report_format", "compliance-audit-csv-v1"));
+        report.append(csvLine("period_start", from.toString()));
+        report.append(csvLine("period_end", to.toString()));
+        report.append(csvLine("record_count", Integer.toString(records.size())));
+        report.append('\n');
+        report.append(csvLine(
+            "check_id",
+            "check_type",
+            "timestamp",
+            "compliant",
+            "violations_summary"
+        ));
+
+        for (ComplianceRecord record : records) {
+            ComplianceResult result = record.getResult();
+            report.append(csvLine(
+                record.getId(),
+                record.getCheckType(),
+                record.getTimestamp().toString(),
+                result == null ? "unknown" : Boolean.toString(result.isCompliant()),
+                summarizeViolations(result)
+            ));
+        }
+
+        return report.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     /**
@@ -193,13 +327,21 @@ public class ComplianceAuditor {
         int attempt = 0;
         while (attempt < MAX_FUCKING_RETRIES) {
             try {
+                SftpCredentials credentials = validateRegulatorCredentials();
                 // TODO: Actually implement SFTP transfer
                 // The JSch library is a fucking nightmare to configure.
-                // The current implementation just logs success without
-                // actually sending anything. The regulator hasn't noticed
-                // because they have a 6-month backlog of reports to process.
+                LOGGER.info(
+                    "Prepared regulator SFTP credentials for " + redactedEndpoint() + ": "
+                    + credentials.redactedSummary()
+                );
                 LOGGER.info("Transmitted " + filename + " to regulator (simulated)");
                 return true;
+            } catch (CredentialLoadException e) {
+                LOGGER.warning(
+                    "Transmission blocked by SFTP credential load failure: "
+                    + e.getCode() + " - " + e.getSafeMessage()
+                );
+                return false;
             } catch (Exception e) {
                 attempt++;
                 LOGGER.warning("Transmission failed (attempt " + attempt + "/" + MAX_FUCKING_RETRIES + "): " + e.getMessage());
@@ -212,6 +354,71 @@ public class ComplianceAuditor {
             }
         }
         return false;
+    }
+
+    private String redactedEndpoint() {
+        if (regulatorEndpoint == null || regulatorEndpoint.isBlank()) {
+            return "endpoint=[REDACTED]";
+        }
+        return "endpoint=" + regulatorEndpoint.replaceAll("(?i)(password|token|secret)=([^&\\s]+)", "$1=[REDACTED]");
+    }
+
+    private static String summarizeViolations(ComplianceResult result) {
+        if (result == null || result.getViolations() == null || result.getViolations().isEmpty()) {
+            return "";
+        }
+        return String.join("; ", result.getViolations());
+    }
+
+    private static boolean isWithinReportPeriod(ComplianceRecord record, LocalDate from, LocalDate to) {
+        LocalDate recordDate = record.getTimestamp().atZone(ZoneOffset.UTC).toLocalDate();
+        return !recordDate.isBefore(from) && !recordDate.isAfter(to);
+    }
+
+    private static String csvLine(String... values) {
+        StringBuilder line = new StringBuilder();
+        for (int i = 0; i < values.length; i++) {
+            if (i > 0) {
+                line.append(',');
+            }
+            line.append(csvValue(values[i]));
+        }
+        line.append('\n');
+        return line.toString();
+    }
+
+    private static String csvValue(String value) {
+        String safeValue = value == null ? "" : value;
+        boolean mustQuote = safeValue.indexOf(',') >= 0
+            || safeValue.indexOf('"') >= 0
+            || safeValue.indexOf('\n') >= 0
+            || safeValue.indexOf('\r') >= 0;
+        if (!mustQuote) {
+            return safeValue;
+        }
+        return "\"" + safeValue.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String requirePresent(String value, String code, String message) {
+        if (isBlank(value)) {
+            throw new CredentialLoadException(code, message);
+        }
+        return value;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    private static boolean parseBoolean(String value, boolean defaultValue) {
+        if (isBlank(value)) {
+            return defaultValue;
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return normalized.equals("1")
+            || normalized.equals("true")
+            || normalized.equals("yes")
+            || normalized.equals("y");
     }
 
     // ------------------------------------------------------------------
@@ -283,23 +490,307 @@ public class ComplianceAuditor {
     // INNER TYPES
     // ------------------------------------------------------------------
 
+    public interface AuditRuleExecutor {
+        ComplianceResult execute(String checkType, Map<String, Object> data);
+    }
+
+    public interface SftpCredentialProvider {
+        SftpCredentials load();
+    }
+
+    public enum SftpAuthMethod {
+        PRIVATE_KEY,
+        PASSWORD
+    }
+
+    public static final class SftpCredentialSource {
+        private static final String ENV_USERNAME = "REGULATOR_SFTP_USERNAME";
+        private static final String ENV_PASSWORD = "REGULATOR_SFTP_PASSWORD";
+        private static final String ENV_PRIVATE_KEY_PATH = "REGULATOR_SFTP_PRIVATE_KEY_PATH";
+        private static final String ENV_ALLOW_PASSWORD = "REGULATOR_SFTP_ALLOW_PASSWORD_FALLBACK";
+
+        private final String username;
+        private final String password;
+        private final String privateKeyPath;
+        private final boolean allowPasswordFallback;
+
+        private SftpCredentialSource(
+            String username,
+            String password,
+            String privateKeyPath,
+            boolean allowPasswordFallback
+        ) {
+            this.username = username;
+            this.password = password;
+            this.privateKeyPath = privateKeyPath;
+            this.allowPasswordFallback = allowPasswordFallback;
+        }
+
+        public static SftpCredentialSource explicit(
+            String username,
+            String password,
+            String privateKeyPath,
+            boolean allowPasswordFallback
+        ) {
+            return new SftpCredentialSource(username, password, privateKeyPath, allowPasswordFallback);
+        }
+
+        public static SftpCredentialSource fromEnvironment(Map<String, String> environment) {
+            Objects.requireNonNull(environment, "environment");
+            return new SftpCredentialSource(
+                environment.get(ENV_USERNAME),
+                environment.get(ENV_PASSWORD),
+                firstPresent(
+                    environment.get(ENV_PRIVATE_KEY_PATH),
+                    environment.get("REGULATOR_SFTP_KEY_PATH")
+                ),
+                parseBoolean(environment.get(ENV_ALLOW_PASSWORD), false)
+            );
+        }
+
+        public SftpCredentials load() {
+            requirePresent(username, "REGULATOR_SFTP_USERNAME", "SFTP username is required");
+
+            if (!isBlank(privateKeyPath)) {
+                Path keyPath = Path.of(privateKeyPath);
+                if (!Files.isRegularFile(keyPath) || !Files.isReadable(keyPath)) {
+                    throw new CredentialLoadException(
+                        "REGULATOR_SFTP_PRIVATE_KEY_UNREADABLE",
+                        "Configured SFTP private key path is missing or unreadable"
+                    );
+                }
+                return SftpCredentials.forPrivateKey(username, keyPath);
+            }
+
+            if (!isBlank(password)) {
+                if (!allowPasswordFallback) {
+                    throw new CredentialLoadException(
+                        "REGULATOR_SFTP_PASSWORD_FALLBACK_DISABLED",
+                        "Password authentication is configured but password fallback is not allowed"
+                    );
+                }
+                return SftpCredentials.forPassword(username, password);
+            }
+
+            throw new CredentialLoadException(
+                "REGULATOR_SFTP_CREDENTIALS_MISSING",
+                "SFTP private key or allowed password credentials are required"
+            );
+        }
+
+        private static String firstPresent(String first, String second) {
+            return isBlank(first) ? second : first;
+        }
+    }
+
+    public static final class SftpCredentials {
+        private final String username;
+        private final SftpAuthMethod authMethod;
+        private final String password;
+        private final Path privateKeyPath;
+
+        private SftpCredentials(String username, SftpAuthMethod authMethod, String password, Path privateKeyPath) {
+            this.username = username;
+            this.authMethod = authMethod;
+            this.password = password;
+            this.privateKeyPath = privateKeyPath;
+        }
+
+        public static SftpCredentials forPassword(String username, String password) {
+            requirePresent(username, "REGULATOR_SFTP_USERNAME", "SFTP username is required");
+            requirePresent(password, "REGULATOR_SFTP_PASSWORD", "SFTP password is required");
+            return new SftpCredentials(username, SftpAuthMethod.PASSWORD, password, null);
+        }
+
+        public static SftpCredentials forPrivateKey(String username, Path privateKeyPath) {
+            requirePresent(username, "REGULATOR_SFTP_USERNAME", "SFTP username is required");
+            Objects.requireNonNull(privateKeyPath, "privateKeyPath");
+            return new SftpCredentials(username, SftpAuthMethod.PRIVATE_KEY, null, privateKeyPath);
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public SftpAuthMethod getAuthMethod() {
+            return authMethod;
+        }
+
+        public Path getPrivateKeyPath() {
+            return privateKeyPath;
+        }
+
+        public boolean hasPasswordSecret() {
+            return password != null;
+        }
+
+        public String redactedSummary() {
+            StringBuilder summary = new StringBuilder();
+            summary.append("username=").append(username);
+            summary.append(", authMethod=").append(authMethod);
+            if (authMethod == SftpAuthMethod.PRIVATE_KEY) {
+                summary.append(", privateKeyPath=").append(privateKeyPath);
+            }
+            if (password != null) {
+                summary.append(", password=[REDACTED]");
+            }
+            return summary.toString();
+        }
+    }
+
+    public static final class CredentialLoadException extends RuntimeException {
+        private final String code;
+        private final String safeMessage;
+
+        public CredentialLoadException(String code, String safeMessage) {
+            super(code + ": " + safeMessage);
+            this.code = code;
+            this.safeMessage = safeMessage;
+        }
+
+        public String getCode() {
+            return code;
+        }
+
+        public String getSafeMessage() {
+            return safeMessage;
+        }
+    }
+
+    public interface ComplianceOverrideLoader {
+        ComplianceOverrideLoadResult load();
+
+        static ComplianceOverrideLoader disabled() {
+            return ComplianceOverrideLoadResult::disabled;
+        }
+    }
+
+    public enum ComplianceOverrideStatus {
+        DISABLED,
+        LOADED,
+        FAILED
+    }
+
+    public static class ComplianceOverrideLoadResult {
+        private final ComplianceOverrideStatus status;
+        private final String code;
+        private final String message;
+        private final int bytesLoaded;
+
+        private ComplianceOverrideLoadResult(
+            ComplianceOverrideStatus status,
+            String code,
+            String message,
+            int bytesLoaded
+        ) {
+            this.status = status;
+            this.code = code;
+            this.message = message;
+            this.bytesLoaded = bytesLoaded;
+        }
+
+        public static ComplianceOverrideLoadResult disabled() {
+            return new ComplianceOverrideLoadResult(
+                ComplianceOverrideStatus.DISABLED,
+                "COMPLIANCE_OVERRIDES_DISABLED",
+                "Compliance override loading is disabled; using deterministic defaults",
+                0
+            );
+        }
+
+        public static ComplianceOverrideLoadResult loaded(int bytesLoaded) {
+            return new ComplianceOverrideLoadResult(
+                ComplianceOverrideStatus.LOADED,
+                "COMPLIANCE_OVERRIDES_LOADED",
+                "Compliance overrides loaded successfully",
+                bytesLoaded
+            );
+        }
+
+        public static ComplianceOverrideLoadResult failure(String code, String message) {
+            return new ComplianceOverrideLoadResult(
+                ComplianceOverrideStatus.FAILED,
+                code,
+                message,
+                0
+            );
+        }
+
+        public ComplianceOverrideStatus getStatus() { return status; }
+        public String getCode() { return code; }
+        public String getMessage() { return message; }
+        public int getBytesLoaded() { return bytesLoaded; }
+    }
+
+    public static class HttpComplianceOverrideLoader implements ComplianceOverrideLoader {
+        private final URL configUrl;
+        private final int timeoutMillis;
+
+        public HttpComplianceOverrideLoader(URL configUrl, Duration timeout) {
+            this.configUrl = Objects.requireNonNull(configUrl, "configUrl");
+            Objects.requireNonNull(timeout, "timeout");
+            long millis = timeout.toMillis();
+            if (millis <= 0 || millis > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("timeout must be between 1ms and Integer.MAX_VALUE ms");
+            }
+            this.timeoutMillis = (int) millis;
+        }
+
+        @Override
+        public ComplianceOverrideLoadResult load() {
+            try {
+                HttpURLConnection conn = (HttpURLConnection) configUrl.openConnection();
+                conn.setConnectTimeout(timeoutMillis);
+                conn.setReadTimeout(timeoutMillis);
+
+                int bytesLoaded = 0;
+                try (InputStream is = conn.getInputStream()) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = is.read(buffer)) != -1) {
+                        bytesLoaded += read;
+                    }
+                }
+                return ComplianceOverrideLoadResult.loaded(bytesLoaded);
+            } catch (Exception e) {
+                return ComplianceOverrideLoadResult.failure(
+                    "COMPLIANCE_OVERRIDE_FETCH_FAILED",
+                    sanitizeDiagnosticMessage(e)
+                );
+            }
+        }
+    }
+
     public static class ComplianceRecord {
         private final String id;
         private final String checkType;
         private final Map<String, Object> data;
         private final Instant timestamp;
+        private final ComplianceResult result;
 
         public ComplianceRecord(String id, String checkType, Map<String, Object> data, Instant timestamp) {
+            this(id, checkType, data, timestamp, null);
+        }
+
+        public ComplianceRecord(
+            String id,
+            String checkType,
+            Map<String, Object> data,
+            Instant timestamp,
+            ComplianceResult result
+        ) {
             this.id = id;
             this.checkType = checkType;
             this.data = data;
             this.timestamp = timestamp;
+            this.result = result;
         }
 
         public String getId() { return id; }
         public String getCheckType() { return checkType; }
         public Map<String, Object> getData() { return data; }
         public Instant getTimestamp() { return timestamp; }
+        public ComplianceResult getResult() { return result; }
     }
 
     public static class ComplianceResult {

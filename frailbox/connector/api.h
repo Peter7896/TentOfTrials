@@ -322,6 +322,15 @@ connector_result_t connector_send(const connector_buffer_t *buffer);
 connector_result_t connector_receive(connector_buffer_t *buffer);
 connector_result_t connector_submit(connector_operation_t *operation);
 connector_result_t connector_cancel(uint64_t operation_id);
+
+/**
+ * Wait until all queued and active asynchronous operations finish.
+ *
+ * Returns CONNECTOR_SUCCESS when no operations remain. Returns
+ * CONNECTOR_ERROR_TIMEOUT when the timeout boundary is reached first; in that
+ * case connector_get_stats() exposes the unfinished operation count through
+ * queue_depth and last_error_message contains a human-readable count.
+ */
 connector_result_t connector_wait_all(uint32_t timeout_ms);
 
 /* ------------------------------------------------------------------ */

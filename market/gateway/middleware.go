@@ -38,10 +38,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -67,6 +66,29 @@ const (
 	ContextKeyStartTime  contextKey = "start_time"
 	ContextKeyAuthMethod contextKey = "auth_method"
 )
+
+var ErrTokenVerifierUnavailable = errors.New("token verifier is not configured")
+
+type TokenClaims struct {
+	UserID    string
+	SessionID string
+}
+
+type TokenVerifier interface {
+	VerifyToken(ctx context.Context, token string) (TokenClaims, error)
+}
+
+type TokenVerifierFunc func(ctx context.Context, token string) (TokenClaims, error)
+
+func (fn TokenVerifierFunc) VerifyToken(ctx context.Context, token string) (TokenClaims, error) {
+	return fn(ctx, token)
+}
+
+type rejectAllTokenVerifier struct{}
+
+func (rejectAllTokenVerifier) VerifyToken(context.Context, string) (TokenClaims, error) {
+	return TokenClaims{}, ErrTokenVerifierUnavailable
+}
 
 // ---------------------------------------------------------------------------
 // RESPONSE WRITER
@@ -113,7 +135,7 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("PANIC: %v\n%s", rec, debug.Stack())
-				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+				writeMiddlewareJSON(w, http.StatusInternalServerError, map[string]interface{}{
 					"error":   "internal_server_error",
 					"message": "An unexpected error occurred",
 				})
@@ -147,7 +169,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start)
 
 		log.Printf("[%s] %s %s %d %s %s",
-			getClientIP(r),
+			getMiddlewareClientIP(r),
 			r.Method,
 			r.URL.Path,
 			rw.statusCode,
@@ -202,29 +224,43 @@ func CORSMiddleware(allowedOrigins []string, maxAge time.Duration) func(http.Han
 // AuthMiddleware validates the authentication token and extracts user information.
 // Supports Bearer tokens and API key authentication.
 func AuthMiddleware(next http.Handler) http.Handler {
+	return AuthMiddlewareWithVerifier(next, rejectAllTokenVerifier{})
+}
+
+func AuthMiddlewareWithVerifier(next http.Handler, verifier TokenVerifier) http.Handler {
+	if verifier == nil {
+		verifier = rejectAllTokenVerifier{}
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractToken(r)
 		if token == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			writeMiddlewareJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"error":   "unauthorized",
 				"message": "Missing authentication token",
 			})
 			return
 		}
 
-		// Validate token and extract user info
-		userID, sessionID, err := validateToken(token)
+		claims, err := verifier.VerifyToken(r.Context(), token)
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			writeMiddlewareJSON(w, http.StatusUnauthorized, map[string]interface{}{
 				"error":   "invalid_token",
-				"message": err.Error(),
+				"message": "Authentication token rejected",
+			})
+			return
+		}
+		if claims.UserID == "" || claims.SessionID == "" {
+			writeMiddlewareJSON(w, http.StatusUnauthorized, map[string]interface{}{
+				"error":   "invalid_token",
+				"message": "Authentication token rejected",
 			})
 			return
 		}
 
 		ctx := r.Context()
-		ctx = context.WithValue(ctx, ContextKeyUserID, userID)
-		ctx = context.WithValue(ctx, ContextKeySessionID, sessionID)
+		ctx = context.WithValue(ctx, ContextKeyUserID, claims.UserID)
+		ctx = context.WithValue(ctx, ContextKeySessionID, claims.SessionID)
 		ctx = context.WithValue(ctx, ContextKeyAuthMethod, "bearer")
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -251,7 +287,7 @@ func RateLimitMiddleware(ratePerSecond float64, burst int) func(http.Handler) ht
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := getClientIP(r)
+			key := getMiddlewareClientIP(r)
 			if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
 				key = apiKey
 			}
@@ -276,9 +312,9 @@ func RateLimitMiddleware(ratePerSecond float64, burst int) func(http.Handler) ht
 			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset, 10))
 
 			if !allowed {
-				writeJSON(w, http.StatusTooManyRequests, map[string]interface{}{
-					"error":   "rate_limit_exceeded",
-					"message": "Too many requests. Please slow down.",
+				writeMiddlewareJSON(w, http.StatusTooManyRequests, map[string]interface{}{
+					"error":       "rate_limit_exceeded",
+					"message":     "Too many requests. Please slow down.",
 					"retry_after": reset - time.Now().Unix(),
 				})
 				return
@@ -377,7 +413,7 @@ func CompressMiddleware(next http.Handler) http.Handler {
 // HELPERS
 // ---------------------------------------------------------------------------
 
-func getClientIP(r *http.Request) string {
+func getMiddlewareClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		return strings.TrimSpace(parts[0])
@@ -398,12 +434,6 @@ func generateUUID() string {
 	return hex.EncodeToString(b)
 }
 
-func generateAPIKey() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return base64.URLEncoding.EncodeToString(b)
-}
-
 func extractToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {
@@ -415,20 +445,7 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
-func validateToken(token string) (string, string, error) {
-	// TODO: Implement actual token validation against auth service
-	// This is a stub that accepts any token and returns a fake user ID.
-	// The real implementation should:
-	//   1. Decode the JWT token
-	//   2. Verify the signature
-	//   3. Check expiration
-	//   4. Check revocation status
-	//   5. Extract user ID and session ID
-	//   6. Return them
-	return "user_stub", "session_stub", nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func writeMiddlewareJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)

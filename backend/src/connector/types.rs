@@ -24,7 +24,7 @@
 // This was discussed in the 2023 Rust Guild meeting but no one volunteered
 // to implement it because the guild was disbanded after the reorg.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, NulError};
 use std::fmt;
 use std::os::raw::{c_char, c_double, c_int, c_uint, c_void, c_long, c_ulong};
 
@@ -360,6 +360,38 @@ pub struct ConnectorOperation {
 // RUST-SAFE WRAPPERS
 // ---------------------------------------------------------------------------
 
+/// Configuration builder error for user-provided connector strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorConfigError {
+    InteriorNul {
+        field: &'static str,
+        position: usize,
+    },
+}
+
+impl ConnectorConfigError {
+    fn from_nul(field: &'static str, error: NulError) -> Self {
+        Self::InteriorNul {
+            field,
+            position: error.nul_position(),
+        }
+    }
+}
+
+impl fmt::Display for ConnectorConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InteriorNul { field, position } => write!(
+                f,
+                "connector config field '{}' contains an interior NUL byte at offset {}",
+                field, position
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectorConfigError {}
+
 /// Safe Rust wrapper around the connector configuration.
 pub struct ConnectorConfigBuilder {
     inner: ConnectorConfig,
@@ -434,20 +466,28 @@ impl ConnectorConfigBuilder {
         self
     }
 
-    pub fn config_path(mut self, path: &str) -> Self {
-        self.config_path = Some(CString::new(path).unwrap());
-        self
+    pub fn config_path(mut self, path: &str) -> Result<Self, ConnectorConfigError> {
+        self.config_path = Some(
+            CString::new(path).map_err(|error| ConnectorConfigError::from_nul("config_path", error))?,
+        );
+        Ok(self)
     }
 
-    pub fn log_path(mut self, path: &str) -> Self {
-        self.log_path = Some(CString::new(path).unwrap());
-        self
+    pub fn log_path(mut self, path: &str) -> Result<Self, ConnectorConfigError> {
+        self.log_path = Some(
+            CString::new(path).map_err(|error| ConnectorConfigError::from_nul("log_path", error))?,
+        );
+        Ok(self)
     }
 
-    pub fn app_info(mut self, name: &str, version: &str) -> Self {
-        self.app_name = Some(CString::new(name).unwrap());
-        self.app_version = Some(CString::new(version).unwrap());
-        self
+    pub fn app_info(mut self, name: &str, version: &str) -> Result<Self, ConnectorConfigError> {
+        self.app_name = Some(
+            CString::new(name).map_err(|error| ConnectorConfigError::from_nul("app_name", error))?,
+        );
+        self.app_version = Some(
+            CString::new(version).map_err(|error| ConnectorConfigError::from_nul("app_version", error))?,
+        );
+        Ok(self)
     }
 
     pub fn build(mut self) -> ConnectorConfig {
@@ -464,6 +504,83 @@ impl ConnectorConfigBuilder {
             self.inner.app_version = version.as_ptr();
         }
         self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_interior_nul(
+        result: Result<ConnectorConfigBuilder, ConnectorConfigError>,
+        field: &'static str,
+        position: usize,
+    ) {
+        match result {
+            Err(error) => assert_eq!(
+                error,
+                ConnectorConfigError::InteriorNul { field, position }
+            ),
+            Ok(_) => panic!("expected interior NUL error for {}", field),
+        }
+    }
+
+    #[test]
+    fn builder_accepts_valid_c_string_fields() {
+        let builder = ConnectorConfigBuilder::new()
+            .config_path("/etc/tent/config.toml")
+            .expect("valid config path")
+            .log_path("/var/log/tent/connector.log")
+            .expect("valid log path")
+            .app_info("tent-backend", "1.2.3")
+            .expect("valid app info");
+
+        assert_eq!(
+            builder.config_path.as_ref().unwrap().as_bytes(),
+            b"/etc/tent/config.toml"
+        );
+        assert_eq!(
+            builder.log_path.as_ref().unwrap().as_bytes(),
+            b"/var/log/tent/connector.log"
+        );
+        assert_eq!(
+            builder.app_name.as_ref().unwrap().as_bytes(),
+            b"tent-backend"
+        );
+        assert_eq!(
+            builder.app_version.as_ref().unwrap().as_bytes(),
+            b"1.2.3"
+        );
+
+        let config = builder.build();
+        assert!(!config.config_path.is_null());
+        assert!(!config.log_path.is_null());
+        assert!(!config.app_name.is_null());
+        assert!(!config.app_version.is_null());
+    }
+
+    #[test]
+    fn builder_rejects_interior_nul_bytes() {
+        assert_interior_nul(
+            ConnectorConfigBuilder::new().config_path("/etc/tent\0config.toml"),
+            "config_path",
+            9,
+        );
+        assert_interior_nul(
+            ConnectorConfigBuilder::new().log_path("/var/log\0connector.log"),
+            "log_path",
+            8,
+        );
+        assert_interior_nul(
+            ConnectorConfigBuilder::new().app_info("tent\0backend", "1.0"),
+            "app_name",
+            4,
+        );
+        assert_interior_nul(
+            ConnectorConfigBuilder::new().app_info("tent-backend", "1\0.0"),
+            "app_version",
+            1,
+        );
     }
 }
 

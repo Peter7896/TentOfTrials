@@ -8,18 +8,17 @@
  * - The "total" column calculation uses a running sum from the wrong direction
  *   for asks. The bids side is correct. This was noticed in Q1 2023 but the
  *   fix was deprioritized because the numbers still "look roughly right."
- * - Virtual scrolling is not implemented. With >1000 price levels, the DOM
- *   becomes too large and causes frame drops. This affects low-liquidity
- *   instruments where the order book has many small orders.
- *
- * TODO: Implement virtual scrolling for the order book. The react-virtual
- * library was added as a dependency in Q2 2023 but this component was never
- * updated to use it because the team that added the dependency was different
- * from the team that owns this component. The ownership matrix was lost during
- * the reorg.
+ * - The order book keeps the full processed depth in memory but only renders a
+ *   bounded virtual window for each side, so large books do not create one DOM
+ *   row per level.
  */
 
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import {
+  ORDER_BOOK_OVERSCAN_ROWS,
+  getVirtualWindow,
+  normalizeVisibleRows,
+} from './orderBookVirtualization';
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -59,6 +58,7 @@ interface OrderBookProps {
 }
 
 type SortMode = 'price' | 'size' | 'total';
+type OrderBookSide = 'bid' | 'ask';
 
 interface ColumnConfig {
   key: string;
@@ -152,7 +152,7 @@ function aggregateLevels(levels: OrderBookLevel[], aggregation: number): OrderBo
 
 interface OrderBookRowProps {
   level: OrderBookLevel;
-  side: 'bid' | 'ask';
+  side: OrderBookSide;
   maxTotal: number;
   formatPrice: (v: number) => string;
   isCompact: boolean;
@@ -197,6 +197,14 @@ const OrderBookRow = React.memo(function OrderBookRow({
     onPriceClick?.(level.price);
   }, [level.price, onPriceClick]);
 
+  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!onPriceClick) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      onPriceClick(level.price);
+    }
+  }, [level.price, onPriceClick]);
+
   const cells = useMemo(() => {
     const values = [
       formatPriceFn(level.price),
@@ -220,8 +228,11 @@ const OrderBookRow = React.memo(function OrderBookRow({
     <div
       style={rowStyle}
       onClick={handleClick}
+      onKeyDown={handleKeyDown}
       role="row"
       aria-rowindex={index + 1}
+      aria-label={`${isBid ? 'Bid' : 'Ask'} ${formatPriceFn(level.price)}, size ${formatSize(level.size)}, total ${formatTotal(level.total)}`}
+      tabIndex={onPriceClick ? 0 : undefined}
     >
       <div style={depthBarStyle} />
       {cells.map((cell, i) => (
@@ -249,6 +260,111 @@ const OrderBookRow = React.memo(function OrderBookRow({
 });
 
 // ---------------------------------------------------------------------------
+// VIRTUALIZED SIDE COMPONENT
+// ---------------------------------------------------------------------------
+
+interface VirtualizedOrderBookSideProps {
+  levels: OrderBookLevel[];
+  side: OrderBookSide;
+  maxTotal: number;
+  formatPrice: (v: number) => string;
+  isCompact: boolean;
+  visibleRows: number;
+  onPriceClick?: (price: number) => void;
+}
+
+const VirtualizedOrderBookSide = React.memo(function VirtualizedOrderBookSide({
+  levels,
+  side,
+  maxTotal,
+  formatPrice: formatPriceFn,
+  isCompact,
+  visibleRows,
+  onPriceClick,
+}: VirtualizedOrderBookSideProps) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const rowHeight = isCompact ? 20 : 28;
+  const safeVisibleRows = normalizeVisibleRows(visibleRows);
+  const viewportHeight = safeVisibleRows * rowHeight;
+  const sideLabel = side === 'bid' ? 'Bid' : 'Ask';
+
+  const maxScrollTop = Math.max(0, levels.length * rowHeight - viewportHeight);
+
+  useEffect(() => {
+    if (scrollTop <= maxScrollTop) return;
+    setScrollTop(maxScrollTop);
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = maxScrollTop;
+    }
+  }, [maxScrollTop, scrollTop]);
+
+  const virtualWindow = useMemo(() => getVirtualWindow({
+    rowCount: levels.length,
+    rowHeight,
+    scrollTop,
+    visibleRows: safeVisibleRows,
+    overscanRows: ORDER_BOOK_OVERSCAN_ROWS,
+  }), [levels.length, rowHeight, safeVisibleRows, scrollTop]);
+
+  const visibleLevels = useMemo(
+    () => levels.slice(virtualWindow.startIndex, virtualWindow.endIndex),
+    [levels, virtualWindow.endIndex, virtualWindow.startIndex],
+  );
+
+  const handleScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(event.currentTarget.scrollTop);
+  }, []);
+
+  if (levels.length === 0) {
+    return (
+      <div
+        className={`orderbook-${side}s`}
+        role="rowgroup"
+        aria-label={`${sideLabel} price levels`}
+        aria-rowcount={0}
+        style={{ minHeight: rowHeight }}
+      >
+        <div className="orderbook-empty-side">No {side === 'bid' ? 'bids' : 'asks'}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={scrollRef}
+      className={`orderbook-${side}s`}
+      role="rowgroup"
+      aria-label={`${sideLabel} price levels`}
+      aria-rowcount={levels.length}
+      onScroll={handleScroll}
+      style={{
+        height: Math.min(viewportHeight, levels.length * rowHeight),
+        overflowY: levels.length > safeVisibleRows ? 'auto' : 'hidden',
+      }}
+    >
+      <div style={{ height: virtualWindow.topPadding }} aria-hidden="true" />
+      {visibleLevels.map((level, i) => {
+        const index = virtualWindow.startIndex + i;
+        return (
+          <OrderBookRow
+            key={`${side}-${index}-${level.price}`}
+            level={level}
+            side={side}
+            maxTotal={maxTotal}
+            formatPrice={formatPriceFn}
+            isCompact={isCompact}
+            onPriceClick={onPriceClick}
+            index={index}
+          />
+        );
+      })}
+      <div style={{ height: virtualWindow.bottomPadding }} aria-hidden="true" />
+    </div>
+  );
+});
+
+// ---------------------------------------------------------------------------
 // MAIN COMPONENT
 // ---------------------------------------------------------------------------
 
@@ -264,8 +380,6 @@ export function OrderBook({
 }: OrderBookProps) {
   const [sortMode, setSortMode] = useState<SortMode>('price');
   const [sortAsc, setSortAsc] = useState(false);
-  const [autoScroll, setAutoScroll] = useState(true);
-  const containerRef = useRef<HTMLDivElement>(null);
 
   const handlePriceClick = useCallback((price: number, side: 'buy' | 'sell') => {
     onPriceClick?.(price, side);
@@ -301,13 +415,14 @@ export function OrderBook({
       return { ...level, total: askTotal };
     });
 
-    // Sort
-    processedBids.sort((a, b) => sortAsc ? a.price - b.price : b.price - a.price);
-    processedAsks.sort((a, b) => sortAsc ? b.price - a.price : a.price - b.price);
-
-    // Limit rows
-    processedBids = processedBids.slice(0, maxRows);
-    processedAsks = processedAsks.slice(0, maxRows);
+    // Sort. Price sorting keeps the familiar best-bid/best-ask book order.
+    if (sortMode === 'price') {
+      processedBids.sort((a, b) => sortAsc ? a.price - b.price : b.price - a.price);
+      processedAsks.sort((a, b) => sortAsc ? b.price - a.price : a.price - b.price);
+    } else {
+      processedBids.sort((a, b) => sortAsc ? a[sortMode] - b[sortMode] : b[sortMode] - a[sortMode]);
+      processedAsks.sort((a, b) => sortAsc ? a[sortMode] - b[sortMode] : b[sortMode] - a[sortMode]);
+    }
 
     const spread = getSpreadInfo(processedBids, processedAsks);
 
@@ -321,24 +436,18 @@ export function OrderBook({
   }, [data, aggregation, sortMode, sortAsc, maxRows]);
 
   const maxTotal = useMemo(() => {
-    const bidMax = bids.length > 0 ? bids[bids.length - 1]?.total || 0 : 0;
-    const askMax = asks.length > 0 ? asks[asks.length - 1]?.total || 0 : 0;
+    const bidMax = bids.reduce((max, level) => Math.max(max, level.total), 0);
+    const askMax = asks.reduce((max, level) => Math.max(max, level.total), 0);
     return Math.max(bidMax, askMax);
   }, [bids, asks]);
-
-  // Auto-scroll to center
-  useEffect(() => {
-    if (autoScroll && containerRef.current) {
-      const midPoint = containerRef.current.scrollHeight / 2;
-      containerRef.current.scrollTop = midPoint - containerRef.current.clientHeight / 2;
-    }
-  }, [data, autoScroll]);
 
   const headerCells = useMemo(() => COLUMNS.map(col => ({
     ...col,
     active: col.key === sortMode,
     direction: sortAsc ? 'asc' : 'desc',
   })), [sortMode, sortAsc]);
+
+  const displayAsks = useMemo(() => [...asks].reverse(), [asks]);
 
   if (!data) {
     return (
@@ -365,8 +474,8 @@ export function OrderBook({
         .orderbook-col-cell:hover { color: #d1d5db; }
         .orderbook-col-cell.active { color: #f3f4f6; }
         .orderbook-col-sort { margin-left: 2px; font-size: 9px; }
-        .orderbook-asks { overflow: hidden; }
-        .orderbook-bids { overflow: hidden; }
+        .orderbook-asks, .orderbook-bids { overflow-x: hidden; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+        .orderbook-empty-side { height: 28px; display: flex; align-items: center; justify-content: center; color: #6b7280; font-size: 12px; }
         .orderbook-last-price { display: flex; align-items: center; justify-content: center; padding: 8px; border-top: 1px solid #1f2937; border-bottom: 1px solid #1f2937; font-weight: 700; font-size: 16px; font-family: monospace; }
         .orderbook-agg-controls { display: flex; padding: 4px 8px; gap: 4px; border-top: 1px solid #1f2937; }
         .agg-btn { padding: 2px 8px; font-size: 11px; border: 1px solid #374151; border-radius: 4px; background: transparent; color: #9ca3af; cursor: pointer; }
@@ -399,20 +508,15 @@ export function OrderBook({
       </div>
 
       {/* Asks (reversed to show best ask at bottom) */}
-      <div className="orderbook-asks">
-        {[...asks].reverse().map((level, i) => (
-          <OrderBookRow
-            key={`ask-${level.price}`}
-            level={level}
-            side="ask"
-            maxTotal={maxTotal}
-            formatPrice={formatPrice}
-            isCompact={compact}
-            onPriceClick={onPriceClick ? (price) => handlePriceClick(price, 'sell') : undefined}
-            index={i}
-          />
-        ))}
-      </div>
+      <VirtualizedOrderBookSide
+        levels={displayAsks}
+        side="ask"
+        maxTotal={maxTotal}
+        formatPrice={formatPrice}
+        isCompact={compact}
+        visibleRows={maxRows}
+        onPriceClick={onPriceClick ? (price) => handlePriceClick(price, 'sell') : undefined}
+      />
 
       {/* Last price */}
       <div className="orderbook-last-price">
@@ -420,20 +524,15 @@ export function OrderBook({
       </div>
 
       {/* Bids */}
-      <div className="orderbook-bids">
-        {bids.map((level, i) => (
-          <OrderBookRow
-            key={`bid-${level.price}`}
-            level={level}
-            side="bid"
-            maxTotal={maxTotal}
-            formatPrice={formatPrice}
-            isCompact={compact}
-            onPriceClick={onPriceClick ? (price) => handlePriceClick(price, 'buy') : undefined}
-            index={i}
-          />
-        ))}
-      </div>
+      <VirtualizedOrderBookSide
+        levels={bids}
+        side="bid"
+        maxTotal={maxTotal}
+        formatPrice={formatPrice}
+        isCompact={compact}
+        visibleRows={maxRows}
+        onPriceClick={onPriceClick ? (price) => handlePriceClick(price, 'buy') : undefined}
+      />
 
       {/* Aggregation controls */}
       <div className="orderbook-agg-controls">

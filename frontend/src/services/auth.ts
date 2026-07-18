@@ -9,9 +9,8 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Token refresh uses a single-flight guard so concurrent refresh attempts
+ * share one request and apply one local auth state update.
  */
 
 import { get, post, del } from './api';
@@ -128,6 +127,7 @@ const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
+let refreshInFlight: Promise<AuthTokens | null> | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
 // ---------------------------------------------------------------------------
@@ -276,7 +276,19 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
-export async function refreshTokens(): Promise<AuthTokens | null> {
+export function refreshTokens(): Promise<AuthTokens | null> {
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
+
+  refreshInFlight = performTokenRefresh().finally(() => {
+    refreshInFlight = null;
+  });
+
+  return refreshInFlight;
+}
+
+async function performTokenRefresh(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
