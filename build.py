@@ -422,9 +422,9 @@ def verify_binary(module: Module) -> Optional[str]:
         if not target.exists():
             target = path / "release" / module.name
         if target.exists():
-            return str(target)
+            return target.relative_to(ROOT).as_posix()
     if path.exists():
-        return str(path)
+        return path.relative_to(ROOT).as_posix()
     return None
 
 def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
@@ -502,6 +502,40 @@ def build_diagnostic_report(
     if logd_relpaths and len(logd_relpaths) > 1:
         decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
 
+    def redact(text: str) -> str:
+        if not text: return text
+        import tempfile
+        import getpass
+        import platform
+        
+        home = str(Path.home())
+        tmp = str(tempfile.gettempdir())
+        user = getpass.getuser()
+        
+        # Redact backslashes and forward slashes of these paths
+        replacements = [
+            (str(ROOT), "[REPO]"),
+            (str(ROOT).replace("\\", "/"), "[REPO]"),
+            (home, "[HOME]"),
+            (home.replace("\\", "/"), "[HOME]"),
+            (tmp, "[TMP]"),
+            (tmp.replace("\\", "/"), "[TMP]"),
+        ]
+        
+        for old, new in replacements:
+            if old and old not in ["/", "\\"]:
+                text = text.replace(old, new)
+                
+        # Usernames and hostnames after paths to avoid breaking them
+        if user: text = text.replace(user, "[USER]")
+        try:
+            host = platform.node()
+            if host: text = text.replace(host, "[HOST]")
+        except:
+            pass
+            
+        return text
+
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "commit": commit_id,
@@ -524,7 +558,7 @@ def build_diagnostic_report(
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
                 "artifact": binary,
-                "output": output,
+                "output": redact(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -703,8 +737,8 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [path.relative_to(ROOT).as_posix() for path in logd_files]
+        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else logd_path.relative_to(ROOT).as_posix()
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
