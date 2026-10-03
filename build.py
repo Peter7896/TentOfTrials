@@ -6,12 +6,14 @@ import getpass
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parent
@@ -173,6 +175,134 @@ ENCRYPTLY_BINARIES = {
     "windows-arm64": ENCRYPTLY_DIR / "windows-arm64" / "encryptly.exe",
 }
 LEGACY_ENCRYPTLY_BIN = ENCRYPTLY_DIR / "encryptly"
+
+
+def diagnostic_relative_path(path: Path, root: Path = ROOT) -> str:
+    """Return a repository-relative, portable path for diagnostic metadata."""
+    if PureWindowsPath(path).is_absolute() and not Path(path).is_absolute():
+        raise ValueError("diagnostic artifact is outside the repository")
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("diagnostic artifact is outside the repository") from exc
+    return relative.as_posix()
+
+
+def redact_diagnostic_text(value: object, root: Path = ROOT) -> str:
+    """Remove host identity and absolute filesystem paths from report text."""
+    text = str(value)
+    replacements = [
+        (str(root.resolve()), "<REPO>", False),
+        (str(Path.home().resolve()), "<HOME>", False),
+        (str(Path(tempfile.gettempdir()).resolve()), "<TEMP>", False),
+        (platform.node(), "<HOST>", True),
+        (getpass.getuser(), "<USER>", True),
+    ]
+    # Match both slash styles even when the report came from a different OS.
+    for path, replacement, identity in replacements:
+        if path:
+            variants = {path, path.replace("\\", "/"), path.replace("/", "\\")}
+            for variant in variants:
+                pattern = re.escape(variant)
+                if identity:
+                    pattern = rf"(?<![\w.-]){pattern}(?![\w.-])"
+                else:
+                    pattern = pattern.replace(r"/", r"[/\\]")
+                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    # Catch remaining absolute paths. Directory components may contain spaces;
+    # the final filename is bounded at whitespace so following diagnostics stay.
+    text = re.sub(r"(?i)\bfile://[^\s\"'<>|]+", "<PATH>", text)
+    text = re.sub(
+        r"(?i)(?<![\w])\\\\[^\\/\s]+[\\/](?:[^\\/\r\n\"'<>|]*[\\/])*[^\\/\r\n\"'<>|]+(?=$|[,;:)\]])",
+        "<PATH>",
+        text,
+    )
+    text = re.sub(r"(?i)(?<![\w])\\Device\\[^\s\"'<>|]+", "<PATH>", text)
+    text = re.sub(
+        r"(?i)(?<![\w])(?:[A-Z]:[\\/](?:[^\\/:\r\n\"'<>|]*[\\/])*[^\\/:\s\"'<>|,;:)\]]+|\\\\[^\\\s]+\\[^\s\"']+)",
+        "<PATH>",
+        text,
+    )
+    text = re.sub(
+        r"(?<![\w:/])/(?:[^/:\r\n\"'<>|]*/)*[^/:\s\"'<>|,;:)\]]+",
+        "<PATH>",
+        text,
+    )
+    return text
+
+
+def _normalize_report_paths(value):
+    if isinstance(value, dict):
+        return {key: _normalize_report_paths(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_report_paths(item) for item in value]
+    if isinstance(value, str):
+        return redact_diagnostic_text(value)
+    return value
+
+
+def diagnostic_display_path(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    path = Path(value)
+    if path.is_absolute() or PureWindowsPath(value).is_absolute():
+        try:
+            return diagnostic_relative_path(path)
+        except ValueError:
+            return "<external-path>"
+    return value.replace("\\", "/")
+
+
+def validate_diagnostic_artifact_pair(
+    metadata_path: Path,
+    root: Path = ROOT,
+    require_logd: bool = True,
+) -> list[Path]:
+    """Validate that a report and every .logd it names form a real pair."""
+    if not metadata_path.is_file():
+        raise ValueError(f"diagnostic metadata is missing: {diagnostic_relative_path(metadata_path, root)}")
+    try:
+        report = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("diagnostic metadata is unreadable or invalid JSON") from exc
+    if not isinstance(report, dict):
+        raise ValueError("diagnostic metadata must contain a JSON object")
+
+    entry = report.get("diagnostic_logd")
+    names = [] if entry is None else ([entry] if isinstance(entry, str) else entry)
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise ValueError("diagnostic metadata has an invalid diagnostic_logd value")
+    artifacts = []
+    for name in names:
+        if ("\\" in name or Path(name).is_absolute() or PureWindowsPath(name).is_absolute()
+                or name.startswith("/") or ".." in Path(name).parts):
+            raise ValueError("diagnostic metadata must use safe repository-relative slash paths")
+        candidate = (root / Path(name)).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ValueError("diagnostic artifact path escapes the repository") from exc
+        if candidate.suffix != ".logd" or not candidate.is_file():
+            raise ValueError(f"diagnostic .logd artifact is missing: {name}")
+        if candidate.stat().st_size == 0:
+            raise ValueError(f"diagnostic .logd artifact is empty: {name}")
+        artifacts.append(candidate)
+
+    if len(artifacts) != len(set(artifacts)):
+        raise ValueError("diagnostic metadata contains duplicate .logd artifact paths")
+
+    diagnostic_dir = metadata_path.parent
+    stem = metadata_path.stem.removesuffix("-metadata")
+    actual = sorted(diagnostic_dir.glob(f"{stem}*.logd"))
+    if names and set(artifacts) != {path.resolve() for path in actual}:
+        raise ValueError("diagnostic metadata does not match the generated .logd artifact set")
+    if require_logd and not artifacts:
+        raise ValueError("diagnostic .logd artifact is missing from the metadata pair")
+    if actual and not artifacts:
+        raise ValueError("diagnostic .logd artifact exists but is not referenced by metadata")
+    return artifacts
 
 
 def _normalize_arch(machine: str) -> Optional[str]:
@@ -478,7 +608,7 @@ def collect_system_info() -> str:
             lines.append(f"{key}={value}")
 
     lines.append("")
-    return "\n".join(lines)
+    return redact_diagnostic_text("\n".join(lines))
 
 
 def build_diagnostic_report(
@@ -500,7 +630,7 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = diagnostic_relative_path(DIAGNOSTIC_DIR / f"build-{commit_id}.logd")
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -523,7 +653,7 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
+                "artifact": diagnostic_display_path(binary),
                 "output": output,
             }
             for name, success, elapsed, output, binary in results
@@ -534,11 +664,11 @@ def build_diagnostic_report(
             + "Maintainers may ask you to remove these diagnostic artifacts before merging."
         ),
     }
-    return report
+    return _normalize_report_paths(report)
 
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
-    metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    metadata_path.write_text(json.dumps(_normalize_report_paths(report), indent=2) + "\n", encoding="utf-8")
     print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
 
 
@@ -703,8 +833,8 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [diagnostic_relative_path(path) for path in logd_files]
+        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else diagnostic_relative_path(logd_path)
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
@@ -715,6 +845,23 @@ def generate_logd(
                 chunked=len(logd_files) > 1,
             ),
         )
+
+        try:
+            validate_diagnostic_artifact_pair(metadata_path)
+        except ValueError as exc:
+            error = redact_diagnostic_text(f"diagnostic artifact validation failed: {exc}")
+            write_diagnostic_report(
+                metadata_path,
+                build_diagnostic_report(
+                    results,
+                    commit_id,
+                    logd_error=error,
+                    message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
+                ),
+            )
+            print(f"    {color('✗', Colors.RED)} {error}")
+            commit_diagnostic_artifacts([metadata_path], commit_id)
+            return False
 
         for path in logd_files:
             size_kb = path.stat().st_size / 1024.0
