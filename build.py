@@ -6,49 +6,76 @@ import getpass
 import json
 import os
 import platform
+import re
+import hashlib
+import tempfile
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Optional
+
+from tools import safe_logd
 
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
-ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
+DIAGNOSTIC_BLOCKER_MESSAGE = "Safe diagnostic generation failed; inspect the metadata error."
+
+
+def current_source_commit() -> str:
+    """Read the actual source revision; never invent a zero commit on failure."""
+    result = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=str(ROOT),
+                            capture_output=True, text=True, timeout=5)
+    commit = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", commit):
+        raise ValueError("Cannot identify the source Git commit")
+    return commit
+
+
+def current_source_tree() -> str:
+    result = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=str(ROOT),
+                            capture_output=True, text=True, timeout=5)
+    tree = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", tree):
+        raise ValueError("Cannot identify the source Git tree")
+    return tree
 
 
 def current_commit_id() -> str:
-    """Return the first 4 bytes (8 hex chars) of HEAD for stable per-commit diagnostics."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        commit = result.stdout.strip()
-        if result.returncode == 0 and len(commit) >= 8:
-            return commit[:8]
-    except Exception:
-        pass
-    return "00000000"
+    return current_source_commit()[:8]
 
 
-def diagnostic_paths_for_commit() -> tuple[Path, Path, str]:
-    """Return stable diagnostic artifact paths under diagnostic/ for the current commit."""
-    DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
-    commit_id = current_commit_id()
-    logd_path = DIAGNOSTIC_DIR / f"build-{commit_id}.logd"
-    metadata_path = DIAGNOSTIC_DIR / f"build-{commit_id}.json"
-    return logd_path, metadata_path, commit_id
+def require_clean_source() -> None:
+    result = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=str(ROOT),
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode != 0 or result.stdout.strip():
+        raise ValueError("Commit source changes and resolve untracked files before generating diagnostics")
+
+
+def validate_diagnostic_directory() -> None:
+    expected = ROOT.resolve() / "diagnostic"
+    if DIAGNOSTIC_DIR.is_symlink() or DIAGNOSTIC_DIR.resolve() != expected:
+        raise ValueError("diagnostic directory must not be a symlink or escape the repository")
+
+
+def diagnostic_paths_for_commit(commit_id: Optional[str] = None) -> tuple[Path, Path, str]:
+    """Use only the real repository's diagnostic directory; refuse redirection."""
+    validate_diagnostic_directory()
+    DIAGNOSTIC_DIR.mkdir(exist_ok=True)
+    commit_id = commit_id or current_commit_id()
+    if not re.fullmatch(r"[0-9a-f]{8}", commit_id):
+        raise ValueError("Invalid source commit identifier")
+    return (DIAGNOSTIC_DIR / f"build-{commit_id}.logd",
+            DIAGNOSTIC_DIR / f"build-{commit_id}.json", commit_id)
 
 
 def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SIZE) -> list[Path]:
     """Split an oversized .logd into numbered .logd chunks and remove the original."""
+    if not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("Diagnostic chunk size must be positive")
     if logd_path.stat().st_size <= chunk_size:
         return [logd_path]
 
@@ -61,7 +88,8 @@ def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SI
             if not data:
                 break
             chunk_path = logd_path.with_name(f"{stem}-part{index:03d}.logd")
-            chunk_path.write_bytes(data)
+            with chunk_path.open("xb") as chunk:
+                chunk.write(data)
             chunks.append(chunk_path)
             index += 1
 
@@ -163,105 +191,6 @@ MODULES = [
         build_dir=None,
     ),
 ]
-
-ENCRYPTLY_DIR = ROOT / "tools" / "encryptly"
-ENCRYPTLY_BINARIES = {
-    "linux-x64": ENCRYPTLY_DIR / "linux-x64" / "encryptly",
-    "linux-arm64": ENCRYPTLY_DIR / "linux-arm64" / "encryptly",
-    "macos-arm64": ENCRYPTLY_DIR / "macos-arm64" / "encryptly",
-    "windows-x64": ENCRYPTLY_DIR / "windows-x64" / "encryptly.exe",
-    "windows-arm64": ENCRYPTLY_DIR / "windows-arm64" / "encryptly.exe",
-}
-LEGACY_ENCRYPTLY_BIN = ENCRYPTLY_DIR / "encryptly"
-
-
-def _normalize_arch(machine: str) -> Optional[str]:
-    machine = machine.lower()
-    if machine in {"x86_64", "amd64"}:
-        return "x64"
-    if machine in {"aarch64", "arm64"}:
-        return "arm64"
-    return None
-
-
-def _normalize_os() -> Optional[str]:
-    system = platform.system().lower()
-    if system == "linux":
-        return "linux"
-    if system == "darwin":
-        return "macos"
-    if system == "windows":
-        return "windows"
-    return None
-
-
-def detect_encryptly_platform() -> Optional[str]:
-    os_name = _normalize_os()
-    arch = _normalize_arch(platform.machine())
-    if os_name is None or arch is None:
-        return None
-    return f"{os_name}-{arch}"
-
-
-def get_encryptly_bin() -> Optional[Path]:
-    target = detect_encryptly_platform()
-    if target is not None:
-        binary = ENCRYPTLY_BINARIES.get(target)
-        if binary is not None and binary.exists():
-            return binary
-
-    if LEGACY_ENCRYPTLY_BIN.exists():
-        return LEGACY_ENCRYPTLY_BIN
-
-    return None
-
-
-def encryptly_platform_help() -> str:
-    detected = detect_encryptly_platform() or "unsupported"
-    available = ", ".join(sorted(ENCRYPTLY_BINARIES))
-    return f"detected {detected}; available: {available}"
-
-
-def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
-    """Verify encryptly can create a diagnostic bundle before doing any build work."""
-    encryptly_bin = get_encryptly_bin()
-    if encryptly_bin is None:
-        return False, f"encryptly binary not found ({encryptly_platform_help()})"
-
-    workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
-    safe_dir = workspace / "safe"
-    logd_path = workspace / "preflight.logd"
-    try:
-        shutil.rmtree(workspace, ignore_errors=True)
-        safe_dir.mkdir(parents=True, exist_ok=True)
-        (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
-        result = subprocess.run(
-            [
-                str(encryptly_bin),
-                "pack",
-                str(logd_path),
-                "--include",
-                str(workspace),
-                "--max-file-size",
-                "1",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
-            return False, output
-        if not logd_path.exists():
-            return False, "encryptly preflight completed without creating a .logd"
-        return True, "encryptly preflight passed"
-    except subprocess.TimeoutExpired:
-        return False, f"encryptly preflight TIMEOUT ({timeout}s)"
-    except Exception as e:
-        return False, str(e)
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
 
 class Colors:
     GREEN = "\033[92m"
@@ -440,45 +369,65 @@ def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
         return False, str(e)
 
 
+def redact_diagnostic_text(value: str) -> str:
+    """Remove known local identities/paths; this is not a universal secret filter."""
+    paths = [ROOT, Path.home(), Path(tempfile.gettempdir())]
+    for name in ("TMP", "TEMP", "TMPDIR"):
+        if os.environ.get(name):
+            paths.append(Path(os.environ[name]))
+    tokens = set()
+    for path in paths:
+        for spelling in (str(path), str(path.resolve())):
+            if spelling and spelling not in {"/", "\\"}:
+                tokens.update((spelling, spelling.replace("\\", "/"), spelling.replace("/", "\\")))
+    redacted = value
+    for token in sorted(tokens, key=len, reverse=True):
+        redacted = re.sub(re.escape(token), "<redacted-path>", redacted, flags=re.IGNORECASE)
+    identities = {getpass.getuser(), platform.node()}
+    identities.update(os.environ.get(name, "") for name in ("USER", "USERNAME", "LOGNAME"))
+    for token in sorted(filter(None, identities), key=len, reverse=True):
+        redacted = re.sub(r"(?<![\w.-])" + re.escape(token) + r"(?![\w.-])",
+                          "<redacted-identity>", redacted, flags=re.IGNORECASE)
+    # Known credential labels only; arbitrary secrets still require review.
+    redacted = re.sub(r"(?i)(\b(?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*)[^\s,;]+",
+                      r"\1<redacted-secret>", redacted)
+    redacted = re.sub(r"(?i)(\bAuthorization\s*:\s*Bearer\s+)\S+", r"\1<redacted-secret>", redacted)
+    return redacted
+
+
+def repo_relative_metadata_path(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    try:
+        if PureWindowsPath(path).drive and not Path(path).is_absolute():
+            return None
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = ROOT / candidate
+        return candidate.resolve().relative_to(ROOT.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
 def collect_system_info() -> str:
-    lines = [
-        "Tent of Trials - System Diagnostic Snapshot",
-        "=" * 50,
-        f"generated_at: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
-        f"hostname: {platform.node()}",
-        f"user: {getpass.getuser()}",
-        f"python: {sys.version}",
-        f"platform: {platform.platform()}",
-        f"processor: {platform.processor() or 'unknown'}",
+    """An explicit minimal snapshot: no HOME/files/env/mount-table discovery."""
+    return redact_diagnostic_text("\n".join([
+        "Tent of Trials - Minimal Build Environment",
+        f"python: {sys.version.split()[0]}",
+        f"platform: {platform.system()}",
+        f"machine: {platform.machine()}",
         f"cpu_count: {os.cpu_count()}",
         "",
-        "--- uname ---",
-    ]
-    ok, out = run_cmd(["uname", "-a"])
-    lines.append(out if ok else "unavailable")
+    ]))
 
-    lines.extend(["", "--- /etc/os-release ---"])
-    try:
-        lines.append((Path("/etc/os-release")).read_text(encoding="utf-8", errors="replace").strip())
-    except Exception as e:
-        lines.append(f"unavailable: {e}")
 
-    lines.extend(["", "--- memory ---"])
-    ok, out = run_cmd(["free", "-h"])
-    lines.append(out if ok else "unavailable")
-
-    lines.extend(["", "--- disk ---"])
-    ok, out = run_cmd(["df", "-h"])
-    lines.append(out if ok else "unavailable")
-
-    lines.extend(["", "--- build environment ---"])
-    for key in ["SHELL", "LANG", "TERM", "XDG_SESSION_TYPE", "DISPLAY", "EDITOR"]:
-        value = os.environ.get(key)
-        if value:
-            lines.append(f"{key}={value}")
-
-    lines.append("")
-    return "\n".join(lines)
+def diagnostic_output_preview(output: str, full_available: bool) -> dict:
+    clean = redact_diagnostic_text(output).encode("utf-8")
+    limit = 16 * 1024
+    return {"output": clean[:limit].decode("utf-8", errors="ignore"),
+            "output_truncated": len(clean) > limit,
+            "output_byte_count": len(clean),
+            "full_output": "build.log" if full_available else None}
 
 
 def build_diagnostic_report(
@@ -489,6 +438,8 @@ def build_diagnostic_report(
     logd_error: Optional[str] = None,
     chunked: bool = False,
     message_blocker: Optional[str] = None,
+    source_commit: Optional[str] = None,
+    source_tree: Optional[str] = None,
 ) -> dict:
     diagnostic_logd: Optional[str | list[str]]
     if not logd_relpaths:
@@ -505,14 +456,19 @@ def build_diagnostic_report(
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "commit": commit_id,
+        "source_commit": source_commit,
+        "source_tree": source_tree,
+        "source_dirty": False,
+        "format": safe_logd.FORMAT,
+        "password_semantics": "Random base64url AES-256 key. Publishing this JSON permits decryption and forgery; not an author signature.",
         "diagnostic_logd": diagnostic_logd,
-        "diagnostic_logd_error": logd_error,
-        "message_blocker": message_blocker,
+        "diagnostic_logd_error": redact_diagnostic_text(logd_error) if logd_error else None,
+        "message_blocker": redact_diagnostic_text(message_blocker) if message_blocker else None,
         "chunked": chunked,
         "chunk_size_bytes": DIAGNOSTIC_CHUNK_SIZE if chunked else None,
         "password": password,
         "decrypt_command": (
-            f"encryptly unpack {decrypt_target} <outdir> --password {password}"
+            f"python3 tools/safe_logd.py unpack {decrypt_target} <new-output-dir> --metadata diagnostic/build-{commit_id}.json"
             if decrypt_target and password else None
         ),
         "total_modules": len(results),
@@ -523,8 +479,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": repo_relative_metadata_path(binary),
+                **diagnostic_output_preview(output, bool(logd_relpaths)),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -538,7 +494,8 @@ def build_diagnostic_report(
 
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
-    metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    with metadata_path.open("x", encoding="utf-8") as output:
+        output.write(json.dumps(report, indent=2) + "\n")
     print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
 
 
@@ -594,156 +551,79 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
 def generate_logd(
     results: list[tuple[str, bool, float, str, Optional[str]]],
     verbose: bool = False,
+    source_commit: Optional[str] = None,
+    source_tree: Optional[str] = None,
 ) -> bool:
-    logd_path, metadata_path, commit_id = diagnostic_paths_for_commit()
-    display_logd = logd_path.relative_to(ROOT)
-    print(f"\n  {color('▸', Colors.CYAN)} Finalizing diagnostics for {color(str(display_logd), Colors.BOLD)}...")
-
-    # Always write the JSON report first. The encrypted .logd is useful, but the
-    # report is required even when the build failed before compilation started or
-    # when encryptly itself is unavailable.
-    write_diagnostic_report(metadata_path, build_diagnostic_report(results, commit_id))
-
-    encryptly_bin = get_encryptly_bin()
-    if encryptly_bin is None:
-        error = f"encryptly binary not found ({encryptly_platform_help()}); cannot create {display_logd}"
-        print(f"    {color('✗', Colors.RED)} {error}")
-        write_diagnostic_report(
-            metadata_path,
-            build_diagnostic_report(
-                results,
-                commit_id,
-                logd_error=error,
-                message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
-            ),
-        )
-        print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
-        commit_diagnostic_artifacts([metadata_path], commit_id)
-        return False
-
-    # Workspace must live under $HOME because encryptly refuses paths outside home.
-    home = Path.home()
-    workspace = home / ".cache" / "tent-of-trials" / "logd-workspace"
-    safe_dir = workspace / "safe"
-
+    """Create real encrypted diagnostics from three explicit, redacted texts."""
+    metadata_path = None
+    commit_id = None
     try:
-        shutil.rmtree(workspace, ignore_errors=True)
-        safe_dir.mkdir(parents=True, exist_ok=True)
+        actual_commit = current_source_commit()
+        actual_tree = current_source_tree()
+        if source_tree is not None and source_tree != actual_tree:
+            raise ValueError("Source tree changed during the build")
+        source_tree = actual_tree
+        if source_commit is not None and source_commit != actual_commit:
+            raise ValueError("Source HEAD changed during the build")
+        source_commit = actual_commit
+        require_clean_source()
+        logd_path, metadata_path, commit_id = diagnostic_paths_for_commit(source_commit[:8])
+        # Do not silently replace evidence for an already-diagnosed source.
+        if any(DIAGNOSTIC_DIR.glob(f"build-{commit_id}*")):
+            metadata_path = None
+            raise ValueError("Diagnostics already exist for this source commit; preserve them and use a fresh source commit")
 
-        (safe_dir / "system-info.txt").write_text(
-            collect_system_info(), encoding="utf-8"
-        )
-
-        summary_lines = [
-            "Tent of Trials - Build Summary",
-            "=" * 50,
-            f"generated_at: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
-            f"total_modules: {len(results)}",
-            f"passed: {sum(1 for _, s, _, _, _ in results if s)}",
-            f"failed: {sum(1 for _, s, _, _, _ in results if not s)}",
-            "",
-            "module results:",
-        ]
-        for name, success, elapsed, _, binary in results:
-            summary_lines.append(
-                f"  {name}: {'PASS' if success else 'FAIL'} ({elapsed:.2f}s)"
-                f"{f' [{binary}]' if binary else ''}"
-            )
-        (safe_dir / "build-summary.txt").write_text(
-            "\n".join(summary_lines), encoding="utf-8"
-        )
-
-        log_lines = []
+        summary = ["Tent of Trials - Build Summary", f"source_commit: {source_commit}",
+                   f"source_tree: {source_tree}",
+                   f"format: {safe_logd.FORMAT}",
+                   f"total_modules: {len(results)}",
+                   f"passed: {sum(1 for _, success, _, _, _ in results if success)}",
+                   f"failed: {sum(1 for _, success, _, _, _ in results if not success)}"]
+        logs = [f"source_commit: {source_commit}"]
         for name, success, elapsed, output, binary in results:
-            log_lines.append(
-                f"\n{'=' * 50}\n{name} ({'PASS' if success else 'FAIL'}, {elapsed:.2f}s)\n"
-                f"{'=' * 50}"
-            )
-            if binary:
-                log_lines.append(f"artifact: {binary}")
-            if output:
-                log_lines.append(output)
-        (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
-
-        sr = subprocess.run(
-            [
-                str(encryptly_bin),
-                "pack",
-                str(logd_path),
-                "--include",
-                str(workspace),
-                "--max-file-size",
-                "35840",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if sr.returncode != 0:
-            error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
-            print(
-                f"    {color('✗', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
-                f"{error}"
-            )
-            if logd_path.exists():
-                logd_path.unlink()
-            write_diagnostic_report(
-                metadata_path,
-                build_diagnostic_report(
-                    results,
-                    commit_id,
-                    logd_error=error,
-                    message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
-                ),
-            )
-            print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
-            commit_diagnostic_artifacts([metadata_path], commit_id)
-            return False
-
-        safe_pw = sr.stdout.strip()
-        logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
-        write_diagnostic_report(
-            metadata_path,
-            build_diagnostic_report(
-                results,
-                commit_id,
-                logd_relpaths=logd_relpaths,
-                password=safe_pw,
-                chunked=len(logd_files) > 1,
-            ),
-        )
-
-        for path in logd_files:
-            size_kb = path.stat().st_size / 1024.0
-            print(
-                f"    {color('✓', Colors.GREEN)} {path.relative_to(ROOT)} created "
-                f"({size_kb:.1f} KiB)"
-            )
-        if len(logd_files) > 1:
-            print(
-                f"    {color('✓', Colors.GREEN)} split oversized diagnostic log into "
-                f"{len(logd_files)} chunks of at most {DIAGNOSTIC_CHUNK_SIZE // (1024 * 1024)} MiB"
-            )
+            label = f"{name}: {'PASS' if success else 'FAIL'} ({elapsed:.2f}s)"
+            summary.append(label)
+            logs.extend([label, output])
+            artifact = repo_relative_metadata_path(binary)
+            if artifact:
+                summary.append(f"artifact: {artifact}")
+                logs.append(f"artifact: {artifact}")
+        texts = {
+            "build.log": redact_diagnostic_text("\n".join(logs)),
+            "build-summary.txt": redact_diagnostic_text("\n".join(summary)),
+            "system-info.txt": collect_system_info(),
+        }
+        key = safe_logd.pack_diagnostic_texts(logd_path, texts)
+        if safe_logd.unpack_diagnostic_texts(logd_path, key) != texts:
+            raise ValueError("Generated diagnostic round-trip verification failed")
+        logd_files = split_diagnostic_logd(logd_path, DIAGNOSTIC_CHUNK_SIZE)
+        relpaths = [path.relative_to(ROOT).as_posix() for path in logd_files]
+        report = build_diagnostic_report(results, commit_id, logd_relpaths=relpaths,
+                                        password=key, chunked=len(logd_files) > 1,
+                                        source_commit=source_commit, source_tree=source_tree)
+        report["files"] = {name: {"bytes": len(text.encode("utf-8")),
+                                  "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+                           for name, text in texts.items()}
+        report["artifact_sha256"] = {path.relative_to(ROOT).as_posix():
+                                      hashlib.sha256(path.read_bytes()).hexdigest()
+                                      for path in logd_files}
+        write_diagnostic_report(metadata_path, report)
         if not commit_diagnostic_artifacts([metadata_path, *logd_files], commit_id):
             return False
-
-        if safe_pw:
-            print()
-            print(f"  {color('Password', Colors.BOLD)} - this is required to decrypt the diagnostic log,")
-            print(f"             which is required to submit a PR. Upload the")
-            print(f"             diagnostic log file(s) and metadata file with this password.")
-            if len(logd_files) > 1:
-                print(f"             Reassemble chunks in order before unpacking:")
-                print(f"             cat {' '.join(logd_relpaths)} > {logd_path.relative_to(ROOT)}")
-            print(f"  {color(safe_pw, Colors.CYAN)}")
-            print(f"  {color(f'encryptly unpack {decrypt_target} <outdir> --password {safe_pw}', Colors.GRAY)}")
+        print("    Safe diagnostics verified. JSON contains the public decryption key.")
+        print("    Format: safe-logd-v1; not compatible with Encryptly.")
         return True
-
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        message = redact_diagnostic_text(str(error))
+        print(f"    Diagnostic failure: {message}")
+        # Failure JSON is evidence of the failure, never a replacement encrypted log.
+        if metadata_path is not None and not metadata_path.exists() and not metadata_path.is_symlink():
+            report = build_diagnostic_report(results, commit_id, logd_error=message,
+                                            message_blocker=DIAGNOSTIC_BLOCKER_MESSAGE,
+                                            source_commit=source_commit, source_tree=source_tree)
+            write_diagnostic_report(metadata_path, report)
+            commit_diagnostic_artifacts([metadata_path], commit_id)
+        return False
 
 
 def print_summary(results: list[tuple[str, bool, float, str, Optional[str]]]):
@@ -855,38 +735,40 @@ Diagnostic bundle:
         return 0
 
     if args.clean:
+        # Validate all diagnostic deletion targets before cleaning any module.
+        try:
+            validate_diagnostic_directory()
+            diagnostic_artifacts = [ROOT / "build.logd"]
+            if DIAGNOSTIC_DIR.exists():
+                prefix = "build-" + "[0-9a-f]" * 8
+                for pattern in (prefix + ".logd", prefix + "-part*.logd",
+                                prefix + ".json", prefix + "-metadata.json"):
+                    diagnostic_artifacts.extend(DIAGNOSTIC_DIR.glob(pattern))
+            if any(path.is_symlink() or (path.exists() and not path.is_file())
+                   for path in diagnostic_artifacts):
+                raise ValueError("Refusing to clean symlink or non-file diagnostic entries")
+        except (OSError, ValueError) as error:
+            print(f"  Cannot clean diagnostics: {redact_diagnostic_text(str(error))}")
+            return 1
         print(f"\n  {color('Cleaning build artifacts...', Colors.YELLOW)}")
         for module in selected:
             clean_module(module, args.verbose)
-
-        diagnostic_artifacts = [ROOT / "build.logd"]
-        if DIAGNOSTIC_DIR.exists():
-            diagnostic_artifacts.extend(DIAGNOSTIC_DIR.glob("build-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].logd"))
-            diagnostic_artifacts.extend(DIAGNOSTIC_DIR.glob("build-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-part*.logd"))
-            diagnostic_artifacts.extend(DIAGNOSTIC_DIR.glob("build-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json"))
-            diagnostic_artifacts.extend(DIAGNOSTIC_DIR.glob("build-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-metadata.json"))
         for artifact in diagnostic_artifacts:
             if artifact.exists():
-                if artifact.is_dir():
-                    shutil.rmtree(artifact)
-                else:
-                    artifact.unlink()
+                artifact.unlink()
                 print(f"  {color('▸', Colors.YELLOW)} Removed {artifact.relative_to(ROOT)}")
         print(f"\n  {color('Clean complete.', Colors.GREEN)}")
         return 0
 
-    print(f"\n  {color('Checking encryptly diagnostics...', Colors.GRAY)}")
-    encryptly_start = time.time()
-    encryptly_ok, encryptly_message = check_encryptly_runs()
-    if not encryptly_ok:
-        elapsed = time.time() - encryptly_start
-        blocker = f"{ENCRYPTLY_BLOCKER_MESSAGE} {encryptly_message}"
-        print(f"  {color('✗ encryptly cannot run', Colors.RED)}")
-        print(f"  {color('BLOCKER:', Colors.RED)} {blocker}")
-        results = [("encryptly-preflight", False, elapsed, blocker, None)]
-        generate_logd(results, args.verbose)
+    # Capture the source revision before any module command; generated artifacts
+    # name this source commit, not the later automatic diagnostics commit.
+    try:
+        source_commit = current_source_commit()
+        source_tree = current_source_tree()
+        require_clean_source()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"  Cannot build source-matched diagnostics: {redact_diagnostic_text(str(error))}")
         return 1
-    print(f"  {color('✓ encryptly runs', Colors.GREEN)}")
 
     print(f"\n  {color(f'Building {len(selected)} module(s) | release={args.release}', Colors.GRAY)}")
 
@@ -899,7 +781,7 @@ Diagnostic bundle:
 
     print_summary(results)
 
-    diagnostics_ok = generate_logd(results, args.verbose)
+    diagnostics_ok = generate_logd(results, args.verbose, source_commit=source_commit, source_tree=source_tree)
 
     return 0 if diagnostics_ok and all(r[1] for r in results) else 1
 
