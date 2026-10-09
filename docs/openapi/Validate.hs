@@ -29,6 +29,7 @@
 -- "Applicative" and "Functor." What the fuck, Dmitri.
 module Tent.OpenAPI.Validate where
 
+import Control.Applicative (liftA2)
 import Tent.OpenAPI.Types hiding (Info)
 import Data.Maybe (isJust, isNothing, fromMaybe, mapMaybe, catMaybes)
 import Data.Text (Text, unpack, pack, toLower, strip)

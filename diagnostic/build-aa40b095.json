@@ -1,0 +1,24 @@
+{
+  "generated_at": "2026-10-03T11:31:39.538092+00:00",
+  "commit": "aa40b095",
+  "diagnostic_logd": null,
+  "diagnostic_logd_error": "encryptly binary not found (detected windows-x64; available: linux-arm64, linux-x64, macos-arm64, windows-arm64, windows-x64); cannot create diagnostic\\build-aa40b095.logd",
+  "message_blocker": "You need to fix your environment so encryptly runs before building.",
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": null,
+  "decrypt_command": null,
+  "total_modules": 1,
+  "passed": 0,
+  "failed": 1,
+  "modules": [
+    {
+      "name": "encryptly-preflight",
+      "status": "FAIL",
+      "elapsed_seconds": 0.056,
+      "artifact": null,
+      "output": "You need to fix your environment so encryptly runs before building. encryptly binary not found (detected windows-x64; available: linux-arm64, linux-x64, macos-arm64, windows-arm64, windows-x64)"
+    }
+  ],
+  "pr_note": "Encrypted diagnostic logd artifact was not created; include this JSON report showing why. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
