@@ -63,6 +63,7 @@ class SafeDiagnosticsIntegrationTests(unittest.TestCase):
         self.assertEqual(set(texts), set(safe_logd.REQUIRED_FILES))
         for name, text in texts.items():
             self.assertEqual(report['files'][name]['sha256'], hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(build.validate_diagnostic_metadata(self.metadata, self.root), [])
         self.assertEqual(report['format'], safe_logd.FORMAT)
         self.assertNotIn('encryptly', report['decrypt_command'].lower())
 
@@ -78,7 +79,7 @@ class SafeDiagnosticsIntegrationTests(unittest.TestCase):
     def test_short_identity_does_not_destroy_ordinary_words(self):
         with patch.object(build.getpass, 'getuser', return_value='me'):
             self.assertEqual(build.redact_diagnostic_text('metadata memory user=me'),
-                             'metadata memory user=<redacted-identity>')
+                             'metadata memory user=<redacted>')
 
     def test_windows_case_and_slash_spellings(self):
         # A path's textual spelling can differ from this host's separator/case.
@@ -103,6 +104,7 @@ class SafeDiagnosticsIntegrationTests(unittest.TestCase):
             self.assertTrue(self.generate('long log ' * 50))
         report = json.loads(self.metadata.read_text())
         self.assertTrue(report['chunked'])
+        self.assertEqual(build.validate_diagnostic_metadata(self.metadata, self.root), [])
         self.assertGreater(len(report['diagnostic_logd']), 1)
         self.assertFalse((self.diag / 'build-cafebabe.logd').exists())
         reassembled = self.root / 'reassembled.logd'
