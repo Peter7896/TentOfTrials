@@ -1,0 +1,2 @@
+# Authenticated encryption for the source-visible safe-logd-v1 diagnostic format.
+cryptography==50.0.2
