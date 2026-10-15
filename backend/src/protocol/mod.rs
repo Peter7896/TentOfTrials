@@ -25,6 +25,8 @@ pub mod events;
 pub mod messages;
 pub mod serialize;
 pub mod validate;
+#[cfg(test)]
+mod frame_tests;
 pub mod codec;
 pub mod rpc;
 
