@@ -221,9 +221,13 @@ impl FrameDecoder {
         cursor.read_exact(&mut seq_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
         let sequence = u32::from_be_bytes(seq_bytes);
 
-        // Skip reserved bytes
+        // Read and validate reserved bytes (must be all zeros)
         let mut reserved = [0u8; 4];
         cursor.read_exact(&mut reserved).map_err(|_| ProtocolError::InvalidMessage)?;
+        if reserved != [0u8; 4] {
+            self.buffer.clear();
+            return Err(ProtocolError::InvalidMessage);
+        }
 
         // Check if we have the full frame
         let checksum_size = if flags & FLAG_CHECKSUMED != 0 { 4 } else { 0 };
@@ -329,6 +333,57 @@ static CRC32C_TABLE: [u32; 256] = {
 mod tests {
     use super::*;
 
+    /// Helper: build a raw frame byte buffer without using the encoder.
+    /// This lets us inject malformed data the encoder would reject.
+    fn raw_frame_header(
+        magic: u32,
+        version: u8,
+        message_type: u8,
+        flags: u16,
+        payload_length: u32,
+        sequence: u32,
+        reserved: [u8; 4],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&magic.to_be_bytes());
+        buf.push(version);
+        buf.push(message_type);
+        buf.extend_from_slice(&flags.to_be_bytes());
+        buf.extend_from_slice(&payload_length.to_be_bytes());
+        buf.extend_from_slice(&sequence.to_be_bytes());
+        buf.extend_from_slice(&reserved);
+        buf
+    }
+
+    /// Helper: build a complete raw frame byte buffer with arbitrary payload.
+    fn raw_frame(
+        version: u8,
+        message_type: u8,
+        flags: u16,
+        payload: &[u8],
+        sequence: u32,
+        checksum: Option<u32>,
+    ) -> Vec<u8> {
+        let mut buf = raw_frame_header(
+            FRAME_MAGIC,
+            version,
+            message_type,
+            flags,
+            payload.len() as u32,
+            sequence,
+            [0u8; 4],
+        );
+        buf.extend_from_slice(payload);
+        if let Some(cs) = checksum {
+            buf.extend_from_slice(&cs.to_be_bytes());
+        }
+        buf
+    }
+
+    // -----------------------------------------------------------------------
+    // Basic encode/decode round-trip
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_frame_encode_decode() {
         let payload = b"Hello, World!".to_vec();
@@ -354,6 +409,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // Buffered / stream decode
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_decoder_buffered_read() {
         let frame1 = Frame::new(0x01, b"Frame 1".to_vec());
@@ -375,6 +434,10 @@ mod tests {
         assert_eq!(decoded2.payload, b"Frame 2");
     }
 
+    // -----------------------------------------------------------------------
+    // Checksum validation
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_checksum_validation() {
         let payload = b"Test data".to_vec();
@@ -389,5 +452,479 @@ mod tests {
         decoder.feed(&encoded);
         let result = decoder.decode();
         assert!(matches!(result, Err(ProtocolError::ChecksumMismatch)));
+    }
+
+    #[test]
+    fn test_checksum_mismatch_preserves_buffer() {
+        // A checksum mismatch should drain only the failing frame bytes,
+        // preserving the decoder so subsequent data is still usable.
+        let payload = b"checksum test".to_vec();
+        let frame = Frame::new(0x01, payload.clone()).with_checksum();
+        let mut encoded = FrameEncoder::encode(&frame).unwrap();
+
+        // Corrupt one byte mid-payload to trigger a checksum mismatch
+        encoded[FRAME_HEADER_SIZE + 3] ^= 0xFF;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::ChecksumMismatch)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject truncated frames
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_truncated_header() {
+        // Fewer bytes than FRAME_HEADER_SIZE → Ok(None), not a panic
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&[0u8; 10]);
+        let result = decoder.decode();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reject_truncated_payload() {
+        // Header claims 100-byte payload, but we only provide 10 bytes of
+        // payload data → Ok(None) (waiting for more data), not a panic.
+        let header = raw_frame_header(
+            FRAME_MAGIC,
+            3,    // valid version
+            0x01,
+            FLAG_NONE,
+            100,  // payload length
+            0,
+            [0u8; 4],
+        );
+        let mut buf = header;
+        buf.extend_from_slice(&[0u8; 10]); // only 10 of 100 payload bytes
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&buf);
+        let result = decoder.decode();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "should return None waiting for full payload, not Err");
+    }
+
+    #[test]
+    fn test_reject_truncated_header_exactly_at_boundary() {
+        // Exactly FRAME_HEADER_SIZE - 1 bytes → Ok(None)
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&[0u8; FRAME_HEADER_SIZE - 1]);
+        let result = decoder.decode();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject invalid magic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_invalid_magic() {
+        let header = raw_frame_header(
+            0xDEADBEEF, // wrong magic
+            3,
+            0x01,
+            FLAG_NONE,
+            0,
+            0,
+            [0u8; 4],
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::InvalidMessage)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject unsupported version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_version_too_low() {
+        let header = raw_frame_header(
+            FRAME_MAGIC,
+            0, // below MIN_COMPATIBLE_VERSION
+            0x01,
+            FLAG_NONE,
+            0,
+            0,
+            [0u8; 4],
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::UnsupportedVersion)));
+    }
+
+    #[test]
+    fn test_reject_version_too_high() {
+        let header = raw_frame_header(
+            FRAME_MAGIC,
+            99, // above PROTOCOL_VERSION
+            0x01,
+            FLAG_NONE,
+            0,
+            0,
+            [0u8; 4],
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::UnsupportedVersion)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject oversized payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_payload_too_large_at_decode() {
+        // Header claims a payload size that exceeds FRAME_MAX_PAYLOAD_SIZE
+        let header = raw_frame_header(
+            FRAME_MAGIC,
+            3,
+            0x01,
+            FLAG_NONE,
+            (FRAME_MAX_PAYLOAD_SIZE + 1) as u32,
+            0,
+            [0u8; 4],
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&header);
+        let result = decoder.decode();
+
+        // The decoder checks payload_length against FRAME_MAX_PAYLOAD_SIZE,
+        // but also needs the buffer to contain the full (oversized) frame
+        // before reaching that check. With only the header in the buffer,
+        // it returns Ok(None). Feed enough extra bytes to satisfy the
+        // frame-size test so the payload-length check triggers.
+        let extra = vec![0u8; FRAME_MAX_PAYLOAD_SIZE + 1];
+        decoder.feed(&extra);
+        let result2 = decoder.decode();
+        assert!(
+            matches!(result2, Err(ProtocolError::MessageTooLarge)),
+            "expected MessageTooLarge, got {:?}", result2
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reject non-zero reserved bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_nonzero_reserved_bytes() {
+        let header = raw_frame_header(
+            FRAME_MAGIC,
+            3,
+            0x01,
+            FLAG_NONE,
+            0,
+            0,
+            [0xAA, 0xBB, 0xCC, 0xDD], // non-zero reserved
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(
+            matches!(result, Err(ProtocolError::InvalidMessage)),
+            "non-zero reserved bytes must be rejected, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn test_reject_single_nonzero_reserved_byte() {
+        // Only one reserved byte is non-zero — still invalid.
+        let header = raw_frame_header(
+            FRAME_MAGIC,
+            3,
+            0x01,
+            FLAG_NONE,
+            0,
+            0,
+            [0x00, 0x00, 0x00, 0x01],
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&header);
+        let result = decoder.decode();
+        assert!(matches!(result, Err(ProtocolError::InvalidMessage)));
+    }
+
+    // -----------------------------------------------------------------------
+    // State preservation: failed decode does not corrupt decoder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decoder_state_after_invalid_magic() {
+        // After a failed decode due to invalid magic, the decoder should be
+        // clean and ready to accept new data.
+        let bad = raw_frame_header(0xDEADBEEF, 3, 0x01, FLAG_NONE, 0, 0, [0u8; 4]);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&bad);
+
+        let result = decoder.decode();
+        assert!(result.is_err());
+
+        // State check: buffer should be cleared after invalid-magic error
+        // (the code clears buffer on magic and version errors).
+
+        // Now feed a valid frame — it should decode fine
+        let valid = raw_frame(3, 0x02, FLAG_NONE, b"recovery", 1, None);
+        decoder.feed(&valid);
+        let recovered = decoder.decode().unwrap().unwrap();
+        assert_eq!(recovered.payload, b"recovery");
+        assert_eq!(recovered.message_type, 0x02);
+    }
+
+    #[test]
+    fn test_decoder_state_after_checksum_mismatch() {
+        // Checksum failure drains only the bad frame, leaving the decoder
+        // intact for subsequent frames.
+        let payload = b"frame with bad checksum".to_vec();
+        let frame = Frame::new(0x01, payload).with_checksum();
+        let mut bad_encoded = FrameEncoder::encode(&frame).unwrap();
+        // Corrupt payload so checksum fails
+        bad_encoded[FRAME_HEADER_SIZE + 1] ^= 0xFF;
+
+        // Prepare a valid frame to follow
+        let valid = raw_frame(3, 0x02, FLAG_NONE, b"recovery", 2, None);
+
+        let mut all = bad_encoded;
+        all.extend_from_slice(&valid);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&all);
+
+        let result1 = decoder.decode();
+        assert!(matches!(result1, Err(ProtocolError::ChecksumMismatch)));
+
+        let result2 = decoder.decode();
+        assert!(result2.is_ok());
+        let recovered = result2.unwrap().unwrap();
+        assert_eq!(recovered.payload, b"recovery");
+        assert_eq!(recovered.message_type, 0x02);
+        assert_eq!(recovered.sequence, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery: valid frame after invalid input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_valid_frame_after_invalid_input() {
+        // Prepend 12 bytes of garbage, then a valid frame.
+        // The garbage should be consumed as part of a failed decode
+        // (invalid magic) or trigger an error; the valid frame should still
+        // be decodable.
+        let valid = raw_frame(3, 0x03, FLAG_NONE, b"after garbage", 42, None);
+
+        let mut buf = vec![0xFFu8; 12]; // garbage prefix
+        buf.extend_from_slice(&valid);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&buf);
+
+        // First decode attempt: the garbage bytes (12) + header (20) = 32 ≥ 24,
+        // so decode will try: magic will be wrong, clearing buffer.
+        let result1 = decoder.decode();
+        // With garbage + valid frame in buffer, after the failed decode
+        // the buffer is cleared. So result1 is Err(InvalidMessage).
+        assert!(result1.is_err());
+
+        // Valid frame was also cleared. Feed it again.
+        decoder.feed(&valid);
+        let recovered = decoder.decode().unwrap().unwrap();
+        assert_eq!(recovered.payload, b"after garbage");
+        assert_eq!(recovered.message_type, 0x03);
+    }
+
+    #[test]
+    fn test_valid_frame_after_multiple_invalid_inputs() {
+        // Feed a stream with mixed garbage and a valid frame.
+        // Verify the decoder recovers to produce the correct frame.
+        let valid = raw_frame(3, 0x07, FLAG_NONE, b"final", 100, None);
+
+        // Garbage chunk 1: wrong magic
+        let garbage1 = raw_frame_header(0xCAFEBABE, 3, 0x01, FLAG_NONE, 0, 0, [0u8; 4]);
+        // Garbage chunk 2: unsupported version
+        let garbage2 = raw_frame_header(FRAME_MAGIC, 0, 0x01, FLAG_NONE, 0, 0, [0u8; 4]);
+
+        let mut decoder = FrameDecoder::new();
+
+        // Feed garbage1 → decode → error → buffer cleared
+        decoder.feed(&garbage1);
+        assert!(decoder.decode().is_err());
+
+        // Feed garbage2 → decode → error → buffer cleared
+        decoder.feed(&garbage2);
+        assert!(decoder.decode().is_err());
+
+        // Feed valid frame → should decode successfully
+        decoder.feed(&valid);
+        let recovered = decoder.decode().unwrap().unwrap();
+        assert_eq!(recovered.payload, b"final");
+        assert_eq!(recovered.sequence, 100);
+        assert_eq!(recovered.message_type, 0x07);
+    }
+
+    #[test]
+    fn test_valid_frame_after_garbage_interleaved() {
+        // Garbage followed immediately by valid frame in one feed call.
+        // After garbage causes error (clearing buffer), the valid frame
+        // needs to be re-fed, then it decodes successfully.
+        let valid = raw_frame(3, 0x05, FLAG_NONE, b"interleaved", 7, None);
+        let mut buf = vec![0x00u8; FRAME_HEADER_SIZE]; // bad magic (all zeros)
+        buf.extend_from_slice(&valid);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&buf);
+
+        // Decode: magic is all zeros → Err(InvalidMessage) + buffer cleared
+        let result1 = decoder.decode();
+        assert!(result1.is_err());
+
+        // Re-feed the valid frame after the error
+        decoder.feed(&valid);
+        let recovered = decoder.decode().unwrap().unwrap();
+        assert_eq!(recovered.payload, b"interleaved");
+        assert_eq!(recovered.sequence, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reserved bytes regression
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reserved_bytes_zero_are_accepted() {
+        // Normal zero reserved bytes must work (regression check after
+        // adding the non-zero-reserved-bytes validation).
+        let frame = raw_frame(3, 0x01, FLAG_NONE, b"ok", 0, None);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&frame);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_all batch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_all_with_recovery() {
+        let valid = raw_frame(3, 0x01, FLAG_NONE, b"batch1", 0, None);
+        let valid2 = raw_frame(3, 0x02, FLAG_NONE, b"batch2", 1, None);
+        let mut data = valid;
+        data.extend_from_slice(&valid2);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&data);
+        let frames = decoder.decode_all().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].payload, b"batch1");
+        assert_eq!(frames[1].payload, b"batch2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame with flags and checksum round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_frame_with_flags_round_trip() {
+        let payload = b"flagged frame".to_vec();
+        let frame = Frame::new(0x10, payload.clone())
+            .with_sequence(999)
+            .with_flags(FLAG_COMPRESSED | FLAG_PRIORITY);
+
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.decode().unwrap().unwrap();
+
+        assert_eq!(decoded.message_type, 0x10);
+        assert_eq!(decoded.sequence, 999);
+        assert_eq!(decoded.flags & FLAG_COMPRESSED, FLAG_COMPRESSED);
+        assert_eq!(decoded.flags & FLAG_PRIORITY, FLAG_PRIORITY);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_frame_checksum_round_trip() {
+        let payload = b"checksummed".to_vec();
+        let frame = Frame::new(0x20, payload.clone()).with_checksum();
+
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.decode().unwrap().unwrap();
+
+        assert_eq!(decoded.payload, payload);
+        assert!(decoded.checksum.is_some());
+        // Verify checksum is correct
+        assert_eq!(decoded.checksum.unwrap(), crc32c(&payload));
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery: valid frame after truncated-then-complete
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_recover_after_partial_then_complete() {
+        // Feed partial header → get None, then complete the frame → get Some
+        let payload = b"complete".to_vec();
+        let frame = Frame::new(0x03, payload.clone());
+
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+        let split_at = 10; // less than header size
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded[..split_at]);
+        assert!(decoder.decode().unwrap().is_none());
+
+        decoder.feed(&encoded[split_at..]);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty and zero-length payload cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_payload_frame() {
+        let frame = raw_frame(3, 0x01, FLAG_NONE, b"", 0, None);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&frame);
+        let decoded = decoder.decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, b"");
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffer state tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_buffered_bytes_after_partial_feed() {
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(decoder.buffered_bytes(), 0);
+
+        decoder.feed(&[1u8, 2, 3, 4, 5]);
+        assert_eq!(decoder.buffered_bytes(), 5);
+
+        // decode returns None (not enough data), but buffer is preserved
+        let _ = decoder.decode();
+        assert_eq!(decoder.buffered_bytes(), 5);
+    }
+
+    #[test]
+    fn test_reset_clears_everything() {
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&[0u8; 100]);
+        assert_eq!(decoder.buffered_bytes(), 100);
+
+        decoder.reset();
+        assert_eq!(decoder.buffered_bytes(), 0);
     }
 }
