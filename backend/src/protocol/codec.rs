@@ -129,7 +129,7 @@ impl FrameEncoder {
         buf.extend_from_slice(&frame.flags.to_be_bytes());
         buf.extend_from_slice(&(frame.payload.len() as u32).to_be_bytes());
         buf.extend_from_slice(&frame.sequence.to_be_bytes());
-        buf.extend_from_slice(&[0u8; 4]); // reserved
+        buf.extend_from_slice(&[0u8; 8]); // reserved (must be zero on the wire)
 
         // Payload
         buf.extend_from_slice(&frame.payload);
@@ -158,6 +158,7 @@ impl FrameEncoder {
 pub struct FrameDecoder {
     buffer: Vec<u8>,
     partial_frame: Option<Vec<u8>>,
+    accepted_frames: u64,
 }
 
 impl FrameDecoder {
@@ -165,7 +166,12 @@ impl FrameDecoder {
         Self {
             buffer: Vec::with_capacity(FRAME_MAX_SIZE),
             partial_frame: None,
+            accepted_frames: 0,
         }
+    }
+
+    pub fn accepted_frames(&self) -> u64 {
+        self.accepted_frames
     }
 
     pub fn feed(&mut self, data: &[u8]) {
@@ -221,8 +227,8 @@ impl FrameDecoder {
         cursor.read_exact(&mut seq_bytes).map_err(|_| ProtocolError::InvalidMessage)?;
         let sequence = u32::from_be_bytes(seq_bytes);
 
-        // Skip reserved bytes
-        let mut reserved = [0u8; 4];
+        // Read reserved bytes (must be zero)
+        let mut reserved = [0u8; 8];
         cursor.read_exact(&mut reserved).map_err(|_| ProtocolError::InvalidMessage)?;
 
         // Check if we have the full frame
@@ -231,6 +237,11 @@ impl FrameDecoder {
 
         if self.buffer.len() < total_frame_size {
             return Ok(None);
+        }
+
+        if reserved.iter().any(|&byte| byte != 0) {
+            self.buffer.drain(..total_frame_size);
+            return Err(ProtocolError::InvalidMessage);
         }
 
         // Read payload
@@ -258,6 +269,7 @@ impl FrameDecoder {
 
         // Remove consumed bytes from buffer
         self.buffer.drain(..total_frame_size);
+        self.accepted_frames += 1;
 
         let frame = Frame {
             version,
