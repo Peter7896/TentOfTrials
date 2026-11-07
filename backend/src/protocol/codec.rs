@@ -390,4 +390,55 @@ mod tests {
         let result = decoder.decode();
         assert!(matches!(result, Err(ProtocolError::ChecksumMismatch)));
     }
+
+    #[test]
+    fn test_decoder_recovery_after_checksum_mismatch() {
+        let payload1 = b"Frame 1 - Bad".to_vec();
+        let frame1 = Frame::new(0x01, payload1.clone()).with_checksum();
+        let mut encoded1 = FrameEncoder::encode(&frame1).unwrap();
+        // Corrupt payload to cause checksum mismatch
+        encoded1[FRAME_HEADER_SIZE] ^= 0xFF;
+
+        let payload2 = b"Frame 2 - Good".to_vec();
+        let frame2 = Frame::new(0x02, payload2.clone()).with_checksum();
+        let encoded2 = FrameEncoder::encode(&frame2).unwrap();
+
+        let mut data = encoded1.clone();
+        data.extend_from_slice(&encoded2);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&data);
+        
+        // First frame should error
+        let result1 = decoder.decode();
+        assert!(matches!(result1, Err(ProtocolError::ChecksumMismatch)));
+        
+        // Second frame should succeed without corrupting state
+        let result2 = decoder.decode().unwrap().unwrap();
+        assert_eq!(result2.payload, b"Frame 2 - Good");
+    }
+
+    #[test]
+    fn test_truncated_header_and_payload() {
+        let payload = b"Test data".to_vec();
+        let frame = Frame::new(0x01, payload.clone());
+        let encoded = FrameEncoder::encode(&frame).unwrap();
+
+        let mut decoder = FrameDecoder::new();
+        
+        // Truncated header
+        decoder.feed(&encoded[..10]);
+        let result = decoder.decode().unwrap();
+        assert!(result.is_none());
+        
+        // Truncated payload
+        decoder.feed(&encoded[10..encoded.len() - 2]);
+        let result2 = decoder.decode().unwrap();
+        assert!(result2.is_none());
+
+        // Complete the payload
+        decoder.feed(&encoded[encoded.len() - 2..]);
+        let result3 = decoder.decode().unwrap().unwrap();
+        assert_eq!(result3.payload, b"Test data");
+    }
 }
