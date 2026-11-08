@@ -1,0 +1,69 @@
+{
+  "generated_at": "2026-11-08T00:03:46.197269+00:00",
+  "commit": "8847a4cb",
+  "source_commit": "8847a4cbdda87491b95b3d336589e32c85bd9df6",
+  "source_tree": "61840cd753f830a04d2a2c7fff65d033b343e38e",
+  "source_dirty": false,
+  "format": "safe-logd-v1",
+  "password_semantics": "Random base64url AES-256 key. Publishing this JSON permits decryption and forgery; not an author signature.",
+  "diagnostic_logd": "diagnostic/build-8847a4cb.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "LXlHj93aOQgv7Ujj2yNtkfZhiNIwr3rh2_0QICzpvkw=",
+  "decrypt_command": "python3 tools/safe_logd.py unpack diagnostic/build-8847a4cb.logd <new-output-dir> --metadata diagnostic/build-8847a4cb.json",
+  "total_modules": 3,
+  "passed": 3,
+  "failed": 0,
+  "modules": [
+    {
+      "name": "market",
+      "status": "PASS",
+      "elapsed_seconds": 0.413,
+      "artifact": "market/market",
+      "output": "",
+      "output_truncated": false,
+      "output_byte_count": 0,
+      "full_output": "build.log"
+    },
+    {
+      "name": "compliance",
+      "status": "PASS",
+      "elapsed_seconds": 0.316,
+      "artifact": "compliance/build",
+      "output": "Hinweis: ComplianceAuditor.java verwendet oder \u00fcberschreibt eine veraltete API.\nHinweis: Wiederholen Sie die Kompilierung mit -Xlint:deprecation, um Details zu erhalten.",
+      "output_truncated": false,
+      "output_byte_count": 170,
+      "full_output": "build.log"
+    },
+    {
+      "name": "v2-market-stream",
+      "status": "PASS",
+      "elapsed_seconds": 0.057,
+      "artifact": null,
+      "output": "Syntax OK",
+      "output_truncated": false,
+      "output_byte_count": 9,
+      "full_output": "build.log"
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-8847a4cb.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging.",
+  "files": {
+    "build.log": {
+      "bytes": 365,
+      "sha256": "903605a7b8ebc05be9a3a4139c2a28e64e6775385f078524d15ce86cc5490fdf"
+    },
+    "build-summary.txt": {
+      "bytes": 326,
+      "sha256": "abc4e6935d0509e16b8422bd6ab27ec5ecd560a9a6c9b7b63cc3c8cc6bf3bfee"
+    },
+    "system-info.txt": {
+      "bytes": 104,
+      "sha256": "096fbcb5431230bc2406dad29678575cc7b20b23567c9e2c56e23ec2939f6b9b"
+    }
+  },
+  "artifact_sha256": {
+    "diagnostic/build-8847a4cb.logd": "cc5d93ae3f7a9d0a5d025eb75227ec0fafe6098581169c32a800bba7832f00ef"
+  }
+}
